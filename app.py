@@ -18,11 +18,10 @@ Este aplicativo recebe os arquivos de currículo Lattes (HTML) e, para cada um:
 - Consulta a OpenAlex (usando o ORCID) para obter as publicações do pesquisador;
 - Extrai os DOIs exibidos diretamente no Lattes, juntamente com informações de Título e Ano;
 - Consolida os dados dos artigos (Título, Ano, DOI) considerando se o artigo está presente em cada fonte;
-- Gera um arquivo .txt com as informações consolidadas ;
+- Gera um arquivo .txt com as informações consolidadas;
 - Exibe um relatório consolidado com os resultados;
 - Apresenta um diagrama de Sankey e um diagrama de Venn-Euler para a cobertura dos DOIs.
 """)
-
 
 ##############################
 # FUNÇÕES AUXILIARES
@@ -41,7 +40,6 @@ def normalize_doi(doi):
     doi = doi.replace("http://doi.org/", "")
     return doi
 
-
 def extract_orcid_from_html(content):
     """
     Extrai o primeiro link que contenha 'orcid.org' do conteúdo HTML.
@@ -53,7 +51,6 @@ def extract_orcid_from_html(content):
         if "orcid.org" in href:
             return href
     return None
-
 
 def get_publications_from_orcid(orcid):
     """
@@ -98,11 +95,10 @@ def get_publications_from_orcid(orcid):
 
     return publications
 
-
 def get_publications_from_openalex(orcid):
     """
     Consulta a OpenAlex utilizando o ORCID (removendo o prefixo) e retorna uma lista de publicações.
-    Cada publicação é um dicionário com os campos: Título, Ano e DOI (normalizado).
+    Cada publicação é um dicionário com os campos: Título, Ano, DOI (normalizado) e ISSN-L.
     """
     normalized_orcid = orcid.replace("https://orcid.org/", "").replace("http://orcid.org/", "").strip()
     url = f"https://api.openalex.org/works?filter=authorships.author.orcid:{normalized_orcid}&per_page=200"
@@ -116,15 +112,25 @@ def get_publications_from_openalex(orcid):
                 doi = normalize_doi(doi_raw) if doi_raw else "Sem DOI"
                 title = work.get("display_name", "Sem título")
                 publication_year = work.get("publication_year", "Sem data")
+                # Extração do ISSN-L de primary_location -> source com verificação robusta
+                primary_location = work.get("primary_location")
+                if isinstance(primary_location, dict):
+                    source = primary_location.get("source")
+                    if isinstance(source, dict):
+                        issn_l = source.get("issn_l", "Sem ISSN-L")
+                    else:
+                        issn_l = "Sem ISSN-L"
+                else:
+                    issn_l = "Sem ISSN-L"
                 publications.append({
                     "Título": title,
                     "Ano": publication_year,
-                    "DOI": doi
+                    "DOI": doi,
+                    "ISSN-L": issn_l
                 })
     else:
         st.error(f"Erro ao consultar OpenAlex para {orcid}. Código: {response.status_code}")
     return publications
-
 
 def check_doi_in_lattes(content, doi):
     """
@@ -134,7 +140,6 @@ def check_doi_in_lattes(content, doi):
     if doi and doi != "Sem DOI":
         return doi in content.lower()
     return False
-
 
 def check_openalex(doi):
     """
@@ -150,7 +155,6 @@ def check_openalex(doi):
             return False
     return False
 
-
 def extract_dois_from_lattes(content):
     """
     Extrai DOIs do HTML do currículo Lattes procurando links com a classe "icone-producao icone-doi".
@@ -165,7 +169,6 @@ def extract_dois_from_lattes(content):
         if norm:
             dois.add(norm)
     return dois
-
 
 def extract_articles_info_from_lattes(content):
     """
@@ -189,21 +192,19 @@ def extract_articles_info_from_lattes(content):
         articles[norm] = {"Título": title, "Ano": year}
     return articles
 
-
 def generate_consolidated_txt_content(rows):
     """
     Gera o conteúdo do arquivo .txt a partir da lista de linhas consolidadas.
     Cada linha terá o formato:
-    Índice|Título|Ano|DOI|Presente no Lattes|Presente no ORCID|Presente na OpenAlex
+    Índice|Título|Ano|DOI|Presente no Lattes|Presente no ORCID|Presente na OpenAlex|ISSN-L
     """
     lines = []
-    header = "Índice|Título|Ano|DOI|Presente no Lattes|Presente no ORCID|Presente na OpenAlex"
+    header = "Índice|Título|Ano|DOI|Presente no Lattes|Presente no ORCID|Presente na OpenAlex|ISSN-L"
     lines.append(header)
     for idx, row in enumerate(rows, start=1):
-        line = f"{idx}|{row['Título']}|{row['Ano']}|{row['DOI']}|{row['Presente no Lattes']}|{row['Presente no ORCID']}|{row['Presente na OpenAlex']}"
+        line = f"{idx}|{row['Título']}|{row['Ano']}|{row['DOI']}|{row['Presente no Lattes']}|{row['Presente no ORCID']}|{row['Presente na OpenAlex']}|{row['ISSN-L']}"
         lines.append(line)
     return "\n".join(lines)
-
 
 ##############################
 # INTERFACE STREAMLIT
@@ -260,7 +261,8 @@ if uploaded_files:
                     "Ano": year,
                     "Presente no Lattes": True,
                     "Presente no ORCID": False,
-                    "Presente na OpenAlex": openalex_presente
+                    "Presente na OpenAlex": openalex_presente,
+                    "ISSN-L": "Não disponível"
                 })
             txt_content = generate_consolidated_txt_content(consolidated_rows)
             st.download_button(
@@ -328,6 +330,11 @@ if uploaded_files:
                 row["Presente no ORCID"] = False
             row["Presente no Lattes"] = (doi in lattes_dois)
             row["Presente na OpenAlex"] = (doi in openalex_dict)
+            # Insere o ISSN-L, se disponível (apenas se o DOI estiver em openalex_dict)
+            if doi in openalex_dict:
+                row["ISSN-L"] = openalex_dict[doi].get("ISSN-L", "Sem ISSN-L")
+            else:
+                row["ISSN-L"] = "Não disponível"
             consolidated_rows.append(row)
 
         txt_content = generate_consolidated_txt_content(consolidated_rows)
@@ -411,7 +418,6 @@ if uploaded_files:
         )
     else:
         st.info("Nenhum dado consolidado para exibir.")
-
 
 footer_html = """<div style='text-align: center;'>
   <p>Plataforma desenvolvida por Wellbar - 2025</p>
