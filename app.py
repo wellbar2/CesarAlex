@@ -3,9 +3,10 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import plotly.graph_objects as go
-from matplotlib_venn import venn3
+#from matplotlib_venn import venn3
 import matplotlib.pyplot as plt
 import re
+import math
 import time  # Importado para a pausa
 
 st.set_page_config(page_title="Plataforma CesarAlex", page_icon=None, layout="centered", initial_sidebar_state="auto", menu_items=None)
@@ -206,6 +207,117 @@ def generate_consolidated_txt_content(rows):
         lines.append(line)
     return "\n".join(lines)
 
+
+def create_venn_figure(A, B, C):
+    """
+    Cria um diagrama de Venn interativo para três conjuntos usando Plotly.
+
+    Parâmetros:
+        A, B, C (set): Conjuntos de itens.
+
+    Retorna:
+        fig (go.Figure): Figura do Plotly com o diagrama de Venn.
+    """
+    # Cálculo das regiões
+    a_only = len(A - B - C)
+    b_only = len(B - A - C)
+    c_only = len(C - A - B)
+    ab = len((A & B) - C)
+    ac = len((A & C) - B)
+    bc = len((B & C) - A)
+    abc = len(A & B & C)
+
+    # Parâmetros para os círculos do diagrama
+    r = 1.1  # raio dos círculos
+    # Posicionamento baseado em um triângulo equilátero
+    center_A = (0, 0)
+    center_B = (1, 0)
+    center_C = (0.5, math.sqrt(3)/2)  # aproximadamente (0.5, 0.866)
+
+    # Função auxiliar para gerar a definição de um círculo (shape)
+    def circle_shape(center, r, fillcolor, line_color):
+        cx, cy = center
+        return dict(
+            type="circle",
+            xref="x",
+            yref="y",
+            x0=cx - r,
+            y0=cy - r,
+            x1=cx + r,
+            y1=cy + r,
+            fillcolor=fillcolor,
+            opacity=0.3,
+            line_color=line_color,
+        )
+
+    # Definição dos shapes (círculos)
+    shape_A = circle_shape(center_A, r, "rgba(255, 0, 0, 0.3)", "red")
+    shape_B = circle_shape(center_B, r, "rgba(0, 255, 0, 0.3)", "green")
+    shape_C = circle_shape(center_C, r, "rgba(0, 0, 255, 0.3)", "blue")
+
+    # Cria a figura
+    fig = go.Figure()
+
+    # Adiciona os shapes dos círculos
+    fig.update_layout(shapes=[shape_A, shape_B, shape_C])
+
+    # Adiciona anotações para cada região
+    annotations = [
+        dict(x=-0.5, y=-0.4, text=str(a_only), showarrow=False, font=dict(size=14, color="red")),
+        dict(x=1.5, y=-0.4, text=str(b_only), showarrow=False, font=dict(size=14, color="green")),
+        dict(x=0.5, y=1.3, text=str(c_only), showarrow=False, font=dict(size=14, color="blue")),
+        dict(x=0.5, y=-0.5, text=str(ab), showarrow=False, font=dict(size=14, color="black")),
+        dict(x=0.0, y=0.5, text=str(ac), showarrow=False, font=dict(size=14, color="black")),
+        dict(x=1.0, y=0.5, text=str(bc), showarrow=False, font=dict(size=14, color="black")),
+        dict(x=0.5, y=0.3, text=str(abc), showarrow=False, font=dict(size=14, color="black")),
+    ]
+    fig.update_layout(annotations=annotations)
+
+    # Adiciona traces "dummy" para gerar a legenda
+    fig.add_trace(go.Scatter(
+        x=[None],
+        y=[None],
+        mode='markers',
+        marker=dict(size=10, color='rgba(255, 0, 0, 0.3)', line=dict(color='red', width=2)),
+        name='ORCID: DOIs presentes no ORCID'
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None],
+        y=[None],
+        mode='markers',
+        marker=dict(size=10, color='rgba(0, 255, 0, 0.3)', line=dict(color='green', width=2)),
+        name='Lattes: DOIs presentes no Lattes'
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None],
+        y=[None],
+        mode='markers',
+        marker=dict(size=10, color='rgba(0, 0, 255, 0.3)', line=dict(color='blue', width=2)),
+        name='OpenAlex: DOIs presentes na OpenAlex'
+    ))
+
+    # Configura os eixos para remover as linhas e marcas de fundo
+    fig.update_xaxes(visible=False, showgrid=False, zeroline=False, range=[-2, 3])
+    fig.update_yaxes(visible=False, showgrid=False, zeroline=False, range=[-2, 3])
+
+    # Configuração do layout da figura
+    fig.update_layout(
+        title="Cobertura de Publicações: ORCID vs. Lattes vs. OpenAlex",
+        width=600,
+        height=600,
+        plot_bgcolor="white",
+        legend=dict(
+            x=0.02, y=0.98,
+            bgcolor='rgba(255,255,255,0.5)',
+            bordercolor='Black',
+            borderwidth=1
+        )
+    )
+
+    return fig
+
+
+
 ##############################
 # INTERFACE STREAMLIT
 ##############################
@@ -393,14 +505,19 @@ if uploaded_files:
     B = all_dois_lattes
     C = all_dois_openalex
 
-    plt.figure(figsize=(7, 7))
-    v = venn3(subsets=(len(A - B - C), len(B - A - C), len(A & B - C),
-                       len(C - A - B), len(A & C - B), len(B & C - A),
-                       len(A & B & C)),
-              set_labels=('ORCID', 'Lattes', 'OpenAlex'))
-    plt.title("Cobertura de Publicações: ORCID vs. Lattes vs. OpenAlex")
+    #plt.figure(figsize=(7, 7))
+    #v = venn3(subsets=(len(A - B - C), len(B - A - C), len(A & B - C),
+    #                   len(C - A - B), len(A & C - B), len(B & C - A),
+    #                   len(A & B & C)),
+    #          set_labels=('ORCID', 'Lattes', 'OpenAlex'))
+    #plt.title("Cobertura de Publicações: ORCID vs. Lattes vs. OpenAlex")
     st.markdown("## Diagrama de Venn-Euler")
-    st.pyplot(plt.gcf())
+    #st.pyplot(plt.gcf())
+    fig = create_venn_figure(A, B, C)
+    st.markdown("## Diagrama de Venn Interativo")
+    st.plotly_chart(fig)
+
+
 
     ##############################
     # RELATÓRIO CONSOLIDADO
