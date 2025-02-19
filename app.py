@@ -511,10 +511,10 @@ if uploaded_files:
     #                   len(A & B & C)),
     #          set_labels=('ORCID', 'Lattes', 'OpenAlex'))
     #plt.title("Cobertura de Publicações: ORCID vs. Lattes vs. OpenAlex")
-    st.markdown("## Diagrama de Venn-Euler")
+    #st.markdown("## Diagrama de Venn-Euler")
     #st.pyplot(plt.gcf())
     fig = create_venn_figure(A, B, C)
-    st.markdown("## Diagrama de Venn Interativo")
+    st.markdown("## Diagrama de Venn")
     st.plotly_chart(fig)
 
 
