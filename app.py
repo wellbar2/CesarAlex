@@ -80,9 +80,10 @@ def get_publications_from_orcid(orcid):
                     if work_summary.get("publication-date") and work_summary["publication-date"].get("year"):
                         publication_year = work_summary["publication-date"]["year"].get("value", "Sem data")
                     doi_raw = "Sem DOI"
-                    if "external-ids" in work_summary:
-                        for ext_id in work_summary["external-ids"].get("external-id", []):
-                            if ext_id.get("external-id-type", "").lower() == "doi":
+                    external_ids = work_summary.get("external-ids")
+                    if external_ids and isinstance(external_ids, dict):
+                        for ext_id in external_ids.get("external-id", []):
+                            if isinstance(ext_id, dict) and ext_id.get("external-id-type", "").lower() == "doi":
                                 doi_raw = ext_id.get("external-id-value", "Sem DOI")
                                 break
                     doi = normalize_doi(doi_raw) or "Sem DOI"
