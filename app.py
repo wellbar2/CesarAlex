@@ -75,7 +75,15 @@ def get_publications_from_orcid(orcid):
         if "group" in data:
             for group in data["group"]:
                 for work_summary in group.get("work-summary", []):
-                    title = work_summary.get("title", {}).get("title", {}).get("value", "Sem título")
+                    title_data = work_summary.get("title")
+                    if isinstance(title_data, dict):
+                        inner_title = title_data.get("title")
+                        if isinstance(inner_title, dict):
+                            title = inner_title.get("value", "Sem título")
+                        else:
+                            title = "Sem título"
+                    else:
+                        title = "Sem título"
                     publication_year = "Sem data"
                     if work_summary.get("publication-date") and work_summary["publication-date"].get("year"):
                         publication_year = work_summary["publication-date"]["year"].get("value", "Sem data")
