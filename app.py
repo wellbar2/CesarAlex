@@ -3,436 +3,671 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import plotly.graph_objects as go
-#from matplotlib_venn import venn3
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib_venn import venn3
 import re
-import math
-import time  # Importado para a pausa
+import time
+import csv
+import hashlib
 
-st.set_page_config(page_title="Plataforma CesarAlex", page_icon=None, layout="centered", initial_sidebar_state="auto", menu_items=None)
+
+# =========================
+# CONSTANTES (ajustes internos)
+# =========================
+OPENALEX_DOI_LOOKUP_TIMEOUT = 20          # segundos
+OPENALEX_DOI_LOOKUP_RATE_LIMIT = 0.3      # pausa entre requisições por DOI (segundos)
+OPENALEX_ORCID_RATE_LIMIT = 1.0           # pausa após consulta OpenAlex por ORCID (segundos)
+OPENALEX_PER_PAGE = 200                   # tamanho de página na OpenAlex (máx 200)
+OPENALEX_MAX_PAGES = 25                   # limite de páginas para evitar loops (200*25=5000 works)
+
+
+# =========================
+# STREAMLIT CONFIG
+# =========================
+st.set_page_config(
+    page_title="Plataforma CesarAlex",
+    page_icon=None,
+    layout="centered",
+    initial_sidebar_state="auto"
+)
 
 st.title("Integração de Currículo Lattes, ORCID e OpenAlex")
-st.write("""
-Este aplicativo recebe os arquivos de currículo Lattes (HTML) e, para cada um:
-- Extrai o ORCID (se presente) diretamente do HTML;
-- Consulta a API do ORCID para obter as publicações do pesquisador;
-- Consulta a OpenAlex (usando o ORCID) para obter as publicações do pesquisador;
-- Extrai os DOIs exibidos diretamente no Lattes, juntamente com informações de Título e Ano;
-- Consolida os dados dos artigos (Título, Ano, DOI) considerando se o artigo está presente em cada fonte;
-- Gera um arquivo .txt com as informações consolidadas;
-- Exibe um relatório consolidado com os resultados;
-- Apresenta um diagrama de Sankey e um diagrama de Venn-Euler para a cobertura dos DOIs.
-""")
-
-##############################
-# FUNÇÕES AUXILIARES
-##############################
-
-def normalize_doi(doi):
+st.write(
     """
-    Remove prefixos comuns e coloca o DOI em caixa baixa para permitir a comparação.
-    """
-    if not doi or doi == "Sem DOI":
+Este aplicativo recebe arquivos de currículo Lattes (HTML) e, para cada um:
+- Identifica se o ORCID está Lattes;
+- Consulta a API do ORCID para obter publicações;
+- Consulta a API da OpenAlex usando o ORCID para obter publicações (DOIs + ISSN-L);
+- Extrai DOIs diretamente do Lattes quando existe link na publicação;
+- Consolida as publicações por DOI e permite download em CSV: por pesquisador e geral;
+- Apresenta um gráfico presença ORCID/OpenAlex e um diagrama de cobertura multibase.
+"""
+)
+
+
+# =========================
+# SIDEBAR / OPTIONS
+# =========================
+st.sidebar.header("Opções")
+
+check_openalex_without_orcid = st.sidebar.checkbox(
+    "Verificar OpenAlex mesmo sem ORCID (por DOI)",
+    value=True,
+    help="Se ativado, pode demorar muito mais porque o sistema consulta a OpenAlex para cada DOI individualmente."
+)
+
+
+# =========================
+# HELPERS
+# =========================
+
+def normalize_doi(doi: str):
+    """Normaliza DOI para comparação: remove prefixos e coloca em minúsculo."""
+    if not doi:
         return None
-    doi = doi.lower().strip()
-    doi = doi.replace("http://dx.doi.org/", "")
-    doi = doi.replace("https://dx.doi.org/", "")
-    doi = doi.replace("https://doi.org/", "")
-    doi = doi.replace("http://doi.org/", "")
-    return doi
+    doi = doi.strip().lower()
+    if doi in {"sem doi", "-", "na", "n/a"}:
+        return None
+    for prefix in (
+        "http://dx.doi.org/",
+        "https://dx.doi.org/",
+        "https://doi.org/",
+        "http://doi.org/",
+        "doi:",
+    ):
+        if doi.startswith(prefix):
+            doi = doi.replace(prefix, "", 1).strip()
+    return doi or None
 
-def extract_orcid_from_html(content):
-    """
-    Extrai o primeiro link que contenha 'orcid.org' do conteúdo HTML.
-    Retorna o link ORCID ou None se não encontrado.
-    """
+
+def extract_orcid_from_html(content: str):
+    """Extrai o primeiro link contendo 'orcid.org' do HTML do Lattes."""
     soup = BeautifulSoup(content, "html.parser")
     for link in soup.find_all("a", href=True):
         href = link["href"]
         if "orcid.org" in href:
-            return href
+            return href.strip()
     return None
 
-def get_publications_from_orcid(orcid):
+
+def extract_dois_from_lattes(content: str):
     """
-    Consulta a API ORCID e retorna uma lista de publicações.
-    Cada publicação é um dicionário com os campos: Título, Ano e DOI (normalizado).
+    Extrai DOIs do HTML do Lattes procurando links com classe "icone-producao icone-doi".
+    Retorna set de DOIs normalizados.
     """
-    if "https://orcid.org/" in orcid:
-        orcid_id = orcid.replace("https://orcid.org/", "")
-    elif "http://orcid.org/" in orcid:
-        orcid_id = orcid.replace("http://orcid.org/", "")
-    else:
+    soup = BeautifulSoup(content, "html.parser")
+    dois = set()
+    for link in soup.find_all("a", class_="icone-producao icone-doi"):
+        href = link.get("href", "")
+        doi_norm = normalize_doi(href)
+        if doi_norm:
+            dois.add(doi_norm)
+    return dois
+
+
+def extract_articles_info_from_lattes(content: str):
+    """
+    Extrai informações do item (texto do bloco) e tenta achar um ano (19xx/20xx).
+    Retorna dict: {doi: {"Título": ..., "Ano": ...}}
+    """
+    soup = BeautifulSoup(content, "html.parser")
+    articles = {}
+    for link in soup.find_all("a", class_="icone-producao icone-doi"):
+        href = link.get("href", "")
+        doi_norm = normalize_doi(href)
+        if not doi_norm:
+            continue
+
+        parent = link.find_parent()
+        parent_text = parent.get_text(" ", strip=True) if parent else ""
+        match = re.search(r"\b(19|20)\d{2}\b", parent_text)
+        year = match.group(0) if match else "Não disponível"
+        title = parent_text if parent_text else "Não disponível"
+
+        articles[doi_norm] = {"Título": title, "Ano": year}
+    return articles
+
+
+def get_publications_from_orcid(orcid_link: str):
+    """Consulta ORCID API e retorna lista de publicações com Título, Ano, DOI(normalizado)."""
+    if not orcid_link:
+        return []
+
+    orcid_id = (
+        orcid_link.replace("https://orcid.org/", "")
+        .replace("http://orcid.org/", "")
+        .strip()
+    )
+    if not orcid_id:
         return []
 
     api_url = f"https://pub.orcid.org/v3.0/{orcid_id}/works"
     headers = {"Accept": "application/json"}
-    response = requests.get(api_url, headers=headers)
-    publications = []
 
-    if response.status_code == 200:
-        data = response.json()
-        if "group" in data:
-            for group in data["group"]:
-                for work_summary in group.get("work-summary", []):
-                    title_data = work_summary.get("title")
-                    if isinstance(title_data, dict):
-                        inner_title = title_data.get("title")
-                        if isinstance(inner_title, dict):
-                            title = inner_title.get("value", "Sem título")
-                        else:
-                            title = "Sem título"
-                    else:
-                        title = "Sem título"
-                    publication_year = "Sem data"
-                    if work_summary.get("publication-date") and work_summary["publication-date"].get("year"):
-                        publication_year = work_summary["publication-date"]["year"].get("value", "Sem data")
-                    doi_raw = "Sem DOI"
-                    external_ids = work_summary.get("external-ids")
-                    if external_ids and isinstance(external_ids, dict):
-                        for ext_id in external_ids.get("external-id", []):
-                            if isinstance(ext_id, dict) and ext_id.get("external-id-type", "").lower() == "doi":
-                                doi_raw = ext_id.get("external-id-value", "Sem DOI")
-                                break
-                    doi = normalize_doi(doi_raw) or "Sem DOI"
-                    publications.append({
-                        "Título": title,
-                        "Ano": publication_year,
-                        "DOI": doi
-                    })
-    else:
-        st.error(f"Erro ao consultar a API ORCID para {orcid}. Código: {response.status_code}")
+    try:
+        resp = requests.get(api_url, headers=headers, timeout=30)
+    except Exception:
+        st.error(f"Falha ao acessar ORCID API para {orcid_id}.")
+        return []
 
-    return publications
+    if resp.status_code != 200:
+        st.error(f"Erro ORCID API para {orcid_id}. Código: {resp.status_code}")
+        return []
 
-def get_publications_from_openalex(orcid):
-    """
-    Consulta a OpenAlex utilizando o ORCID (removendo o prefixo) e retorna uma lista de publicações.
-    Cada publicação é um dicionário com os campos: Título, Ano, DOI (normalizado) e ISSN-L.
-    """
-    normalized_orcid = orcid.replace("https://orcid.org/", "").replace("http://orcid.org/", "").strip()
-    url = f"https://api.openalex.org/works?filter=authorships.author.orcid:{normalized_orcid}&per_page=200"
-    response = requests.get(url)
-    publications = []
-    if response.status_code == 200:
-        data = response.json()
-        if "results" in data:
-            for work in data["results"]:
-                doi_raw = work.get("doi", None)
-                doi = normalize_doi(doi_raw) if doi_raw else "Sem DOI"
-                title = work.get("display_name", "Sem título")
-                publication_year = work.get("publication_year", "Sem data")
-                # Extração do ISSN-L de primary_location -> source com verificação robusta
-                primary_location = work.get("primary_location")
-                if isinstance(primary_location, dict):
-                    source = primary_location.get("source")
-                    if isinstance(source, dict):
-                        issn_l = source.get("issn_l", "Sem ISSN-L")
-                    else:
-                        issn_l = "Sem ISSN-L"
-                else:
-                    issn_l = "Sem ISSN-L"
-                publications.append({
-                    "Título": title,
-                    "Ano": publication_year,
-                    "DOI": doi,
-                    "ISSN-L": issn_l
-                })
-    else:
-        st.error(f"Erro ao consultar OpenAlex para {orcid}. Código: {response.status_code}")
-    return publications
+    data = resp.json()
+    pubs = []
 
-def check_doi_in_lattes(content, doi):
-    """
-    Verifica se o DOI normalizado está presente no conteúdo HTML do Lattes.
-    Retorna True se encontrado, False caso contrário.
-    """
-    if doi and doi != "Sem DOI":
-        return doi in content.lower()
-    return False
+    for group in data.get("group", []):
+        for ws in group.get("work-summary", []):
+            title = "Sem título"
+            title_data = ws.get("title")
+            if isinstance(title_data, dict):
+                inner = title_data.get("title")
+                if isinstance(inner, dict):
+                    title = inner.get("value", "Sem título") or "Sem título"
 
-def check_openalex(doi):
+            year = "Sem data"
+            pub_date = ws.get("publication-date")
+            if isinstance(pub_date, dict):
+                y = pub_date.get("year")
+                if isinstance(y, dict):
+                    year = y.get("value", "Sem data") or "Sem data"
+
+            doi_norm = None
+            external_ids = ws.get("external-ids")
+            if isinstance(external_ids, dict):
+                for ext in external_ids.get("external-id", []):
+                    if isinstance(ext, dict) and ext.get("external-id-type", "").lower() == "doi":
+                        doi_norm = normalize_doi(ext.get("external-id-value", ""))
+                        break
+
+            pubs.append({"Título": title, "Ano": year, "DOI": doi_norm})
+
+    return pubs
+
+
+def get_publications_from_openalex_by_orcid(orcid_link: str):
     """
-    Consulta a API OpenAlex para verificar se o DOI (já normalizado) está presente.
-    Retorna True se o DOI for encontrado, False caso contrário.
+    Consulta OpenAlex por ORCID e retorna lista com Título, Ano, DOI(normalizado), ISSN-L.
+    Implementa paginação (cursor) para não truncar em 200 works.
     """
-    if doi and doi != "Sem DOI":
-        url = f"https://api.openalex.org/works/http://dx.doi.org/{doi}"
+    if not orcid_link:
+        return []
+
+    orcid_id = (
+        orcid_link.replace("https://orcid.org/", "")
+        .replace("http://orcid.org/", "")
+        .strip()
+    )
+    if not orcid_id:
+        return []
+
+    pubs = []
+    cursor = "*"
+    pages = 0
+
+    while pages < OPENALEX_MAX_PAGES:
+        url = (
+            "https://api.openalex.org/works"
+            f"?filter=authorships.author.orcid:{orcid_id}"
+            f"&per_page={OPENALEX_PER_PAGE}"
+            f"&cursor={cursor}"
+        )
+
         try:
-            response = requests.get(url)
-            return response.status_code == 200
-        except Exception as e:
-            return False
-    return False
+            resp = requests.get(url, timeout=30)
+        except Exception:
+            st.error(f"Falha ao acessar OpenAlex para ORCID {orcid_id}.")
+            break
 
-def extract_dois_from_lattes(content):
+        if resp.status_code != 200:
+            st.error(f"Erro OpenAlex para ORCID {orcid_id}. Código: {resp.status_code}")
+            break
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        for work in results:
+            doi_norm = normalize_doi(work.get("doi")) if work.get("doi") else None
+            title = work.get("display_name", "Sem título") or "Sem título"
+            year = work.get("publication_year", "Sem data")
+
+            issn_l = "Sem ISSN-L"
+            primary_location = work.get("primary_location")
+            if isinstance(primary_location, dict):
+                source = primary_location.get("source")
+                if isinstance(source, dict):
+                    issn_l = source.get("issn_l", "Sem ISSN-L") or "Sem ISSN-L"
+
+            pubs.append({"Título": title, "Ano": year, "DOI": doi_norm, "ISSN-L": issn_l})
+
+        meta = data.get("meta", {})
+        next_cursor = meta.get("next_cursor")
+        if not next_cursor:
+            break
+
+        cursor = next_cursor
+        pages += 1
+
+    return pubs
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def openalex_lookup_by_doi(doi_norm: str):
+    """Consulta OpenAlex por DOI (normalizado). Cacheado para acelerar quando DOI repete."""
+    if not doi_norm:
+        return {"found": False, "title": None, "year": None, "issn_l": None}
+
+    url = f"https://api.openalex.org/works/http://dx.doi.org/{doi_norm}"
+
+    try:
+        resp = requests.get(url, timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
+    except Exception:
+        return {"found": False, "title": None, "year": None, "issn_l": None}
+
+    if resp.status_code != 200:
+        return {"found": False, "title": None, "year": None, "issn_l": None}
+
+    data = resp.json()
+    title = data.get("display_name")
+    year = data.get("publication_year")
+
+    issn_l = None
+    primary_location = data.get("primary_location")
+    if isinstance(primary_location, dict):
+        source = primary_location.get("source")
+        if isinstance(source, dict):
+            issn_l = source.get("issn_l")
+
+    return {"found": True, "title": title, "year": year, "issn_l": issn_l}
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """
-    Extrai DOIs do HTML do currículo Lattes procurando links com a classe "icone-producao icone-doi".
-    Retorna um conjunto com os DOIs normalizados.
+    Converte DataFrame para CSV com:
+    - separador ;
+    - aspas duplas em TODOS os campos
+    - encoding UTF-8
     """
-    soup = BeautifulSoup(content, "html.parser")
-    dois = set()
-    doi_links = soup.find_all("a", class_="icone-producao icone-doi")
-    for link in doi_links:
-        doi = link.get("href")
-        norm = normalize_doi(doi)
-        if norm:
-            dois.add(norm)
-    return dois
+    return df.to_csv(
+        index=False,
+        sep=";",
+        quoting=csv.QUOTE_ALL,
+        encoding="utf-8"
+    ).encode("utf-8")
 
-def extract_articles_info_from_lattes(content):
+
+def files_fingerprint(uploaded_files) -> str:
     """
-    Extrai informações dos artigos (Título e Ano) do HTML do Lattes.
-    Procura links com a classe "icone-producao icone-doi" e utiliza o texto do elemento pai.
-    Retorna um dicionário: {doi_normalizado: {"Título": ..., "Ano": ...}, ...}
+    Gera uma assinatura estável dos arquivos enviados.
+    Usa nome + tamanho + hash do conteúdo.
     """
-    soup = BeautifulSoup(content, "html.parser")
-    articles = {}
-    doi_links = soup.find_all("a", class_="icone-producao icone-doi")
-    for link in doi_links:
-        doi_raw = link.get("href")
-        norm = normalize_doi(doi_raw)
-        if not norm:
-            continue
-        parent = link.find_parent()
-        parent_text = parent.get_text(" ", strip=True) if parent else ""
-        match = re.search(r'\b(19|20)\d{2}\b', parent_text)
-        year = match.group(0) if match else "Não disponível"
-        title = parent_text if parent_text else "Não disponível"
-        articles[norm] = {"Título": title, "Ano": year}
-    return articles
+    h = hashlib.sha256()
+    for f in uploaded_files:
+        data = f.getvalue()  # bytes
+        h.update(f.name.encode("utf-8"))
+        h.update(str(len(data)).encode("utf-8"))
+        h.update(hashlib.sha256(data).digest())
+    return h.hexdigest()
 
-def generate_consolidated_txt_content(rows):
+
+def init_state():
+    st.session_state.setdefault("fingerprint", None)
+    st.session_state.setdefault("processed", False)
+    st.session_state.setdefault("results", None)
+
+
+def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Gera o conteúdo do arquivo .txt a partir da lista de linhas consolidadas.
-    Cada linha terá o formato:
-    Índice|Título|Ano|DOI|Presente no Lattes|Presente no ORCID|Presente na OpenAlex|ISSN-L
+    Streamlit usa Arrow internamente para exibir dataframes.
+    Se uma coluna mistura tipos (ex: int e str), pode gerar warning/erro.
+    Aqui padronizamos as colunas problemáticas para string somente para EXIBIÇÃO.
     """
-    lines = []
-    header = "Índice|Título|Ano|DOI|Presente no Lattes|Presente no ORCID|Presente na OpenAlex|ISSN-L"
-    lines.append(header)
-    for idx, row in enumerate(rows, start=1):
-        line = f"{idx}|{row['Título']}|{row['Ano']}|{row['DOI']}|{row['Presente no Lattes']}|{row['Presente no ORCID']}|{row['Presente na OpenAlex']}|{row['ISSN-L']}"
-        lines.append(line)
-    return "\n".join(lines)
+    if df is None or df.empty:
+        return df
+
+    df2 = df.copy()
+
+    # colunas que costumam misturar tipos (Ano, booleans, etc.)
+    for col in ["Ano", "Presente no Lattes", "Presente no ORCID", "Presente na OpenAlex"]:
+        if col in df2.columns:
+            df2[col] = df2[col].astype(str)
+
+    # colunas textuais (garante não virar NaN/float)
+    for col in ["Arquivo", "ORCID", "DOI", "Título", "ISSN-L", "Motivo", "Exemplos_DOI_OpenAlex"]:
+        if col in df2.columns:
+            df2[col] = df2[col].fillna("").astype(str)
+
+    return df2
 
 
-def create_venn_figure(A, B, C):
-    """
-    Cria um diagrama de Venn interativo para três conjuntos usando Plotly.
+# ===== VENN (como contarOverlapPorPeriodo) - por observação =====
 
-    Parâmetros:
-        A, B, C (set): Conjuntos de itens.
+def venn_category_for_row(presente_lattes, presente_orcid, presente_openalex):
+    l = bool(presente_lattes)
+    o = bool(presente_orcid)
+    a = bool(presente_openalex)
 
-    Retorna:
-        fig (go.Figure): Figura do Plotly com o diagrama de Venn.
-    """
-    # Cálculo das regiões
-    a_only = len(A - B - C)
-    b_only = len(B - A - C)
-    c_only = len(C - A - B)
-    ab = len((A & B) - C)
-    ac = len((A & C) - B)
-    bc = len((B & C) - A)
-    abc = len(A & B & C)
+    if l and o and a:
+        return "Lattes_ORCID_OpenAlex"
+    if l and o and not a:
+        return "Lattes_ORCID_Apenas"
+    if l and not o and a:
+        return "Lattes_OpenAlex_Apenas"
+    if not l and o and a:
+        return "ORCID_OpenAlex_Apenas"
+    if l and not o and not a:
+        return "Lattes_Apenas"
+    if not l and o and not a:
+        return "ORCID_Apenas"
+    if not l and not o and a:
+        return "OpenAlex_Apenas"
+    return None
 
-    # Parâmetros para os círculos do diagrama
-    r = 1.1  # raio dos círculos
-    # Posicionamento baseado em um triângulo equilátero
-    center_A = (0, 0)
-    center_B = (1, 0)
-    center_C = (0.5, math.sqrt(3)/2)  # aproximadamente (0.5, 0.866)
 
-    # Função auxiliar para gerar a definição de um círculo (shape)
-    def circle_shape(center, r, fillcolor, line_color):
-        cx, cy = center
-        return dict(
-            type="circle",
-            xref="x",
-            yref="y",
-            x0=cx - r,
-            y0=cy - r,
-            x1=cx + r,
-            y1=cy + r,
-            fillcolor=fillcolor,
-            opacity=0.3,
-            line_color=line_color,
+def compute_venn_counts_from_observations(all_report_rows):
+    counts = {
+        "Lattes_Apenas": 0,
+        "ORCID_Apenas": 0,
+        "OpenAlex_Apenas": 0,
+        "Lattes_ORCID_Apenas": 0,
+        "Lattes_OpenAlex_Apenas": 0,
+        "ORCID_OpenAlex_Apenas": 0,
+        "Lattes_ORCID_OpenAlex": 0,
+    }
+    for r in all_report_rows:
+        cat = venn_category_for_row(
+            r.get("Presente no Lattes", False),
+            r.get("Presente no ORCID", False),
+            r.get("Presente na OpenAlex", False),
         )
+        if cat:
+            counts[cat] += 1
+    total = sum(counts.values())
+    return counts, total
 
-    # Definição dos shapes (círculos)
-    shape_A = circle_shape(center_A, r, "rgba(255, 0, 0, 0.3)", "red")
-    shape_B = circle_shape(center_B, r, "rgba(0, 255, 0, 0.3)", "green")
-    shape_C = circle_shape(center_C, r, "rgba(0, 0, 255, 0.3)", "blue")
 
-    # Cria a figura
-    fig = go.Figure()
-
-    # Adiciona os shapes dos círculos
-    fig.update_layout(shapes=[shape_A, shape_B, shape_C])
-
-    # Adiciona anotações para cada região
-    annotations = [
-        dict(x=-0.5, y=-0.4, text=str(a_only), showarrow=False, font=dict(size=14, color="red")),
-        dict(x=1.5, y=-0.4, text=str(b_only), showarrow=False, font=dict(size=14, color="green")),
-        dict(x=0.5, y=1.3, text=str(c_only), showarrow=False, font=dict(size=14, color="blue")),
-        dict(x=0.5, y=-0.5, text=str(ab), showarrow=False, font=dict(size=14, color="black")),
-        dict(x=0.0, y=0.5, text=str(ac), showarrow=False, font=dict(size=14, color="black")),
-        dict(x=1.0, y=0.5, text=str(bc), showarrow=False, font=dict(size=14, color="black")),
-        dict(x=0.5, y=0.3, text=str(abc), showarrow=False, font=dict(size=14, color="black")),
-    ]
-    fig.update_layout(annotations=annotations)
-
-    # Adiciona traces "dummy" para gerar a legenda
-    fig.add_trace(go.Scatter(
-        x=[None],
-        y=[None],
-        mode='markers',
-        marker=dict(size=10, color='rgba(255, 0, 0, 0.3)', line=dict(color='red', width=2)),
-        name='ORCID: DOIs presentes no ORCID'
-    ))
-    fig.add_trace(go.Scatter(
-        x=[None],
-        y=[None],
-        mode='markers',
-        marker=dict(size=10, color='rgba(0, 255, 0, 0.3)', line=dict(color='green', width=2)),
-        name='Lattes: DOIs presentes no Lattes'
-    ))
-    fig.add_trace(go.Scatter(
-        x=[None],
-        y=[None],
-        mode='markers',
-        marker=dict(size=10, color='rgba(0, 0, 255, 0.3)', line=dict(color='blue', width=2)),
-        name='OpenAlex: DOIs presentes na OpenAlex'
-    ))
-
-    # Configura os eixos para remover as linhas e marcas de fundo
-    fig.update_xaxes(visible=False, showgrid=False, zeroline=False, range=[-2, 3])
-    fig.update_yaxes(visible=False, showgrid=False, zeroline=False, range=[-2, 3])
-
-    # Configuração do layout da figura
-    fig.update_layout(
-        title="Cobertura de Publicações: ORCID vs. Lattes vs. OpenAlex",
-        width=600,
-        height=600,
-        plot_bgcolor="white",
-        legend=dict(
-            x=0.02, y=0.98,
-            bgcolor='rgba(255,255,255,0.5)',
-            bordercolor='Black',
-            borderwidth=1
-        )
+def create_venn_like_contarOverlap(counts, total, title):
+    subsets = (
+        counts["Lattes_Apenas"],            # 100
+        counts["ORCID_Apenas"],             # 010
+        counts["Lattes_ORCID_Apenas"],      # 110
+        counts["OpenAlex_Apenas"],          # 001
+        counts["Lattes_OpenAlex_Apenas"],   # 101
+        counts["ORCID_OpenAlex_Apenas"],    # 011
+        counts["Lattes_ORCID_OpenAlex"],    # 111
     )
 
+    cor_lattes = "#009B3A"
+    cor_orcid = "#6A8EAE"
+    cor_openalex = "#D47A70"
+    alpha = 0.6
+
+    region_ids = ["100", "010", "110", "001", "101", "011", "111"]
+
+    def _region_colors_from_dummy():
+        tmp = plt.figure(figsize=(1, 1))
+        vtmp = venn3(
+            subsets=(1, 1, 1, 1, 1, 1, 1),
+            set_labels=("Lattes", "ORCID", "OpenAlex"),
+            alpha=alpha,
+            set_colors=(cor_lattes, cor_orcid, cor_openalex),
+        )
+        colors = {}
+        for rid in region_ids:
+            p = vtmp.get_patch_by_id(rid)
+            if p is not None:
+                colors[rid] = p.get_facecolor()
+        plt.close(tmp)
+        return colors
+
+    region_colors = _region_colors_from_dummy()
+
+    fig = plt.figure(figsize=(8, 8))
+    v = venn3(
+        subsets=subsets,
+        set_labels=("Lattes", "ORCID", "OpenAlex"),
+        alpha=alpha,
+        set_colors=(cor_lattes, cor_orcid, cor_openalex),
+    )
+
+    region_counts = dict(zip(region_ids, subsets))
+
+    for rid in region_ids:
+        lbl = v.get_label_by_id(rid)
+        if lbl:
+            n = region_counts[rid]
+            pct = (n / total) * 100 if total else 0.0
+            lbl.set_text(f"{n}\n({pct:.2f}%)")
+            lbl.set_fontsize(14)
+
+    for lab in v.set_labels:
+        if lab:
+            lab.set_fontweight("bold")
+            lab.set_fontsize(16)
+
+    legend_items = [
+        ("100", "Somente Lattes"),
+        ("010", "Somente ORCID"),
+        ("001", "Somente OpenAlex"),
+        ("110", "Lattes ∩ ORCID"),
+        ("101", "Lattes ∩ OpenAlex"),
+        ("011", "ORCID ∩ OpenAlex"),
+        ("111", "Lattes ∩ ORCID ∩ OpenAlex"),
+    ]
+
+    handles = []
+    for rid, label in legend_items:
+        fc = region_colors.get(rid, (0.8, 0.8, 0.8, alpha))
+        handles.append(mpatches.Patch(facecolor=fc, edgecolor="black", label=label))
+
+    plt.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.08),
+        ncol=2,
+        frameon=True,
+        title="Regiões do diagrama"
+    )
+
+    plt.title(title, fontsize=18)
+    plt.tight_layout()
     return fig
 
 
+# =========================
+# MAIN
+# =========================
+uploaded_files = st.file_uploader(
+    "Selecione os arquivos de currículo Lattes (HTML)",
+    accept_multiple_files=True
+)
 
-##############################
-# INTERFACE STREAMLIT
-##############################
+init_state()
 
-uploaded_files = st.file_uploader("Selecione os arquivos de currículo Lattes (HTML)", accept_multiple_files=True)
+current_fp = files_fingerprint(uploaded_files) if uploaded_files else None
 
-# Contadores para o Sankey:
-files_with_orcid = 0
-files_without_orcid = 0
-files_with_openalex_count = 0
-files_without_openalex_count = 0
+# Se os arquivos mudaram, invalida o processamento anterior
+if current_fp and st.session_state["fingerprint"] != current_fp:
+    st.session_state["fingerprint"] = current_fp
+    st.session_state["processed"] = False
+    st.session_state["results"] = None
 
-# Conjuntos para o diagrama de Venn (DOIs normalizados)
-all_dois_orcid = set()
-all_dois_lattes = set()
-all_dois_openalex = set()
+process_clicked = st.button(
+    "Processar currículos",
+    type="primary",
+    disabled=(not uploaded_files)
+)
 
-all_report = []  # Lista para o relatório consolidado
+if uploaded_files and not st.session_state["processed"]:
+    st.info("Envie os currículos e clique em **Processar currículos** para iniciar o processamento.")
 
-if uploaded_files:
-    for uploaded_file in uploaded_files:
+# =========================
+# PROCESSAMENTO (roda 1x)
+# =========================
+if uploaded_files and process_clicked and not st.session_state["processed"]:
+    # Contadores para Sankey
+    files_with_orcid = 0
+    files_without_orcid = 0
+    files_with_openalex_count = 0
+    files_without_openalex_count = 0
+
+    # Para avisar pesquisadores: "tem OpenAlex mas não tem ORCID no Lattes"
+    no_orcid_but_openalex_files = []
+    no_orcid_but_openalex_rows = []
+
+    all_report = []
+    per_file_df = {}
+
+    file_progress = st.progress(0)
+    status = st.empty()
+    total_files = len(uploaded_files)
+
+    for file_idx, uploaded_file in enumerate(uploaded_files, start=1):
+        status.write(f"Processando {file_idx}/{total_files}: **{uploaded_file.name}**")
         st.markdown(f"---\n### Processando: **{uploaded_file.name}**")
+
         try:
-            content = uploaded_file.read().decode("utf-8")
+            content = uploaded_file.getvalue().decode("utf-8")
         except Exception as e:
-            st.error(f"Erro ao ler o arquivo {uploaded_file.name}: {e}")
+            st.error(f"Erro ao ler {uploaded_file.name}: {e}")
+            file_progress.progress(int((file_idx / total_files) * 100))
             continue
 
-        # Extrai DOIs diretamente do Lattes e informações (Título e Ano)
+        # Extração Lattes
         lattes_dois = extract_dois_from_lattes(content)
-        all_dois_lattes.update(lattes_dois)
         lattes_articles = extract_articles_info_from_lattes(content)
 
-        # Extração do ORCID a partir do HTML
+        # ORCID
         orcid_link = extract_orcid_from_html(content)
+
+        # =========================
+        # CASO: SEM ORCID NO HTML
+        # =========================
         if not orcid_link:
-            st.warning(f"ORCID não encontrado em {uploaded_file.name}.")
+            st.warning("ORCID não encontrado no HTML do Lattes.")
             files_without_orcid += 1
-            # Mesmo sem ORCID, incluímos os DOIs extraídos do Lattes no relatório
-            union_dois = lattes_dois
+
             consolidated_rows = []
-            for doi in union_dois:
-                title = lattes_articles[doi]["Título"] if doi in lattes_articles else "Não disponível"
-                year = lattes_articles[doi]["Ano"] if doi in lattes_articles else "Não disponível"
-                openalex_presente = check_openalex(doi)
-                if openalex_presente:
-                    all_dois_openalex.add(doi)
+            found_in_openalex = []
+
+            doi_progress = None
+            doi_status = None
+
+            dois_list = sorted(lattes_dois)
+            n_dois = len(dois_list)
+
+            if check_openalex_without_orcid and n_dois > 0:
+                doi_progress = st.progress(0)
+                doi_status = st.empty()
+
+            for i, doi in enumerate(dois_list, start=1):
+                info = lattes_articles.get(doi, {"Título": "Não disponível", "Ano": "Não disponível"})
+
+                presente_openalex = False
+                issn_l = "Não disponível"
+                title_oa = None
+                year_oa = None
+
+                if check_openalex_without_orcid:
+                    lookup = openalex_lookup_by_doi(doi)
+                    presente_openalex = bool(lookup.get("found", False))
+
+                    if presente_openalex:
+                        found_in_openalex.append(doi)
+                        issn_l = lookup.get("issn_l") or "Sem ISSN-L"
+                        title_oa = lookup.get("title")
+                        year_oa = lookup.get("year")
+
+                    if doi_progress and doi_status:
+                        doi_status.write(f"Consultando OpenAlex por DOI: {i}/{n_dois}")
+                        doi_progress.progress(int((i / n_dois) * 100))
+
+                    time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
+
+                # Prioridade Título/Ano (sem ORCID): Lattes > OpenAlex(lookup)
+                title_final = info.get("Título", "Não disponível")
+                year_final = info.get("Ano", "Não disponível")
+                if (title_final in ["Não disponível", "", None]) and title_oa:
+                    title_final = title_oa
+                if (year_final in ["Não disponível", "", None]) and year_oa:
+                    year_final = year_oa
+
                 consolidated_rows.append({
                     "Arquivo": uploaded_file.name,
                     "ORCID": "Não disponível",
                     "DOI": doi,
-                    "Título": title,
-                    "Ano": year,
+                    "Título": title_final,
+                    "Ano": year_final,
                     "Presente no Lattes": True,
                     "Presente no ORCID": False,
-                    "Presente na OpenAlex": openalex_presente,
-                    "ISSN-L": "Não disponível"
+                    "Presente na OpenAlex": presente_openalex,
+                    "ISSN-L": issn_l,
                 })
-            txt_content = generate_consolidated_txt_content(consolidated_rows)
-            st.download_button(
-                label=f"Baixar arquivo consolidado (.txt) para {uploaded_file.name}",
-                data=txt_content,
-                file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_consolidado.txt",
-                mime="text/plain"
-            )
+
+            if doi_progress:
+                doi_progress.empty()
+            if doi_status:
+                doi_status.empty()
+
+            df_file = pd.DataFrame(consolidated_rows)
+            per_file_df[uploaded_file.name] = df_file
             all_report.extend(consolidated_rows)
+
+            if check_openalex_without_orcid and len(found_in_openalex) > 0:
+                sample = found_in_openalex[:10]
+                st.info(
+                    f"**Sem ORCID no Lattes, mas com presença na OpenAlex via DOI**: "
+                    f"{len(found_in_openalex)} DOI(s) encontrado(s)."
+                )
+                no_orcid_but_openalex_files.append({
+                    "Arquivo": uploaded_file.name,
+                    "Qtd_DOIs_Lattes": len(lattes_dois),
+                    "Qtd_DOIs_encontrados_OpenAlex": len(found_in_openalex),
+                    "Exemplos_DOI_OpenAlex": "; ".join(sample)
+                })
+
+                for doi in found_in_openalex:
+                    no_orcid_but_openalex_rows.append({
+                        "Arquivo": uploaded_file.name,
+                        "DOI": doi,
+                        "Motivo": "OpenAlex encontrado por DOI, mas ORCID ausente no HTML do Lattes"
+                    })
+
+            file_progress.progress(int((file_idx / total_files) * 100))
             continue
-        else:
-            st.success(f"ORCID encontrado: {orcid_link}")
-            files_with_orcid += 1
 
-        # Consulta à API ORCID para obter publicações
-        orcid_publications = get_publications_from_orcid(orcid_link)
-        orcid_dict = {}
-        for pub in orcid_publications:
-            doi = pub["DOI"]
-            if doi and doi != "Sem DOI":
-                orcid_dict[doi] = pub
-        all_dois_orcid.update(set(orcid_dict.keys()))
+        # =========================
+        # CASO: COM ORCID
+        # =========================
+        st.success(f"ORCID encontrado: {orcid_link}")
+        files_with_orcid += 1
 
-        # Consulta à OpenAlex usando o ORCID e pausa de 1 segundo após a requisição
-        openalex_publications = get_publications_from_openalex(orcid_link)
-        time.sleep(1)  # Pausa de 1 segundo
-        openalex_dict = {}
-        for pub in openalex_publications:
-            doi = pub["DOI"]
-            if doi and doi != "Sem DOI":
-                openalex_dict[doi] = pub
-        all_dois_openalex.update(set(openalex_dict.keys()))
+        # ORCID API
+        orcid_pubs = get_publications_from_orcid(orcid_link)
+        orcid_dict = {p["DOI"]: p for p in orcid_pubs if p.get("DOI")}
 
-        # Atualiza os contadores de arquivos com ou sem publicações da OpenAlex (para arquivos com ORCID)
-        if openalex_publications:
+        # OpenAlex API por ORCID (paginado)
+        openalex_pubs = get_publications_from_openalex_by_orcid(orcid_link)
+        time.sleep(OPENALEX_ORCID_RATE_LIMIT)
+        openalex_dict = {p["DOI"]: p for p in openalex_pubs if p.get("DOI")}
+
+        if openalex_pubs:
             files_with_openalex_count += 1
         else:
             files_without_openalex_count += 1
 
-        # União dos DOIs oriundos do ORCID, dos extraídos do Lattes e dos obtidos da OpenAlex
-        union_dois = set(orcid_dict.keys()) | lattes_dois | set(openalex_dict.keys())
+        # União de DOIs
+        union_dois = set(lattes_dois) | set(orcid_dict.keys()) | set(openalex_dict.keys())
 
         consolidated_rows = []
-        for doi in union_dois:
-            row = {}
-            row["Arquivo"] = uploaded_file.name
-            row["ORCID"] = orcid_link
-            row["DOI"] = doi
-            # Prioridade para definir Título e Ano: ORCID > Lattes > OpenAlex
+        for doi in sorted(union_dois):
+            row = {"Arquivo": uploaded_file.name, "ORCID": orcid_link, "DOI": doi}
+
+            # prioridade Título/Ano: ORCID > Lattes > OpenAlex
             if doi in orcid_dict:
                 row["Título"] = orcid_dict[doi].get("Título", "Sem título")
                 row["Ano"] = orcid_dict[doi].get("Ano", "Sem data")
@@ -449,103 +684,162 @@ if uploaded_files:
                 row["Título"] = "Não disponível"
                 row["Ano"] = "Não disponível"
                 row["Presente no ORCID"] = False
+
             row["Presente no Lattes"] = (doi in lattes_dois)
             row["Presente na OpenAlex"] = (doi in openalex_dict)
-            # Insere o ISSN-L, se disponível (apenas se o DOI estiver em openalex_dict)
-            if doi in openalex_dict:
-                row["ISSN-L"] = openalex_dict[doi].get("ISSN-L", "Sem ISSN-L")
-            else:
-                row["ISSN-L"] = "Não disponível"
+            row["ISSN-L"] = openalex_dict[doi].get("ISSN-L", "Sem ISSN-L") if doi in openalex_dict else "Não disponível"
+
             consolidated_rows.append(row)
 
-        txt_content = generate_consolidated_txt_content(consolidated_rows)
-        st.download_button(
-            label=f"Baixar arquivo consolidado (.txt) para {uploaded_file.name}",
-            data=txt_content,
-            file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_consolidado.txt",
-            mime="text/plain"
-        )
+        df_file = pd.DataFrame(consolidated_rows)
+        per_file_df[uploaded_file.name] = df_file
         all_report.extend(consolidated_rows)
 
-    ##############################
-    # DIAGRAMA DE SANKEY
-    ##############################
-    # Nós do Sankey:
-    # 0: "Arquivos Enviados"
-    # 1: "Tem ORCID"
-    # 2: "Sem ORCID"
-    # 3: "Tem OpenAlex" (dentre os que têm ORCID)
-    # 4: "Sem OpenAlex" (dentre os que têm ORCID)
+        file_progress.progress(int((file_idx / total_files) * 100))
+
+    status.write("Processamento concluído.")
+    file_progress.empty()
+    status.empty()
+
+    df_all = pd.DataFrame(all_report)
+    df_warn_files = pd.DataFrame(no_orcid_but_openalex_files) if no_orcid_but_openalex_files else pd.DataFrame()
+    df_warn_rows = pd.DataFrame(no_orcid_but_openalex_rows) if no_orcid_but_openalex_rows else pd.DataFrame()
+
+    st.session_state["results"] = {
+        "per_file_df": per_file_df,
+        "all_report_df": df_all,
+        "warn_files_df": df_warn_files,
+        "warn_rows_df": df_warn_rows,
+        "sankey": {
+            "files_with_orcid": files_with_orcid,
+            "files_without_orcid": files_without_orcid,
+            "files_with_openalex_count": files_with_openalex_count,
+            "files_without_openalex_count": files_without_openalex_count,
+        },
+        "options": {
+            "check_openalex_without_orcid": check_openalex_without_orcid
+        }
+    }
+    st.session_state["processed"] = True
+    st.success("Processamento concluído. Agora você pode baixar os arquivos sem reprocessar.")
+
+# =========================
+# EXIBIÇÃO (reusa resultados)
+# =========================
+if st.session_state["processed"] and st.session_state["results"]:
+    results = st.session_state["results"]
+
+    # Downloads por arquivo
+    st.markdown("## Arquivos por pesquisador")
+    for fname, df_file in results["per_file_df"].items():
+        st.download_button(
+            label=f"Baixar CSV de: {fname}",
+            data=dataframe_to_csv_bytes(df_file),
+            file_name=f"{fname.rsplit('.', 1)[0]}_individual.csv",
+            mime="text/csv",
+            key=f"dl_file_{fname}"
+        )
+
+    # Sankey
+    st.markdown("## Identificação nas bases")
+
+    s = results["sankey"]
     sankey_labels = ["Arquivos Enviados", "Tem ORCID", "Sem ORCID", "Tem OpenAlex", "Sem OpenAlex"]
-    # Fluxo: do nó 0 para 1 e 2; do nó 1 para 3 e 4.
     sankey_source = [0, 0, 1, 1]
     sankey_target = [1, 2, 3, 4]
-    # Valores:
-    # - Do nó 0: valor = files_with_orcid e files_without_orcid
-    # - Do nó 1: valor = files_with_openalex_count e files_without_openalex_count
-    sankey_values = [files_with_orcid, files_without_orcid, files_with_openalex_count, files_without_openalex_count]
+    sankey_values = [
+        s["files_with_orcid"],
+        s["files_without_orcid"],
+        s["files_with_openalex_count"],
+        s["files_without_openalex_count"],
+    ]
 
     sankey_fig = go.Figure(data=[go.Sankey(
+        arrangement="snap",
+        textfont=dict(
+            family="Arial, sans-serif",
+            size=14,
+            color="black"
+        ),
         node=dict(
-            pad=15,
-            thickness=20,
-            line=dict(color="black", width=0.5),
+            pad=18,
+            thickness=22,
+            line=dict(color="black", width=0.8),
             label=sankey_labels,
             color=["lightblue", "lightgreen", "salmon", "gold", "orange"]
         ),
         link=dict(
             source=sankey_source,
             target=sankey_target,
-            value=sankey_values
+            value=sankey_values,
+            color="rgba(160,160,160,0.55)"
         )
     )])
-    sankey_fig.update_layout(title_text="Fluxo de Arquivos: ORCID e OpenAlex", font_size=10)
-    st.markdown("## Diagrama de Sankey")
-    st.plotly_chart(sankey_fig)
 
-    ##############################
-    # DIAGRAMA DE VENN-EULER (3 conjuntos)
-    ##############################
-    # Conjuntos:
-    # A: DOIs presentes no ORCID
-    # B: DOIs presentes no Lattes
-    # C: DOIs presentes na OpenAlex
-    A = all_dois_orcid
-    B = all_dois_lattes
-    C = all_dois_openalex
+    sankey_fig.update_layout(
+        title=dict(text="Currículos com: ORCID e OpenAlex", x=0.0),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=420,
+        font=dict(
+            family="Arial, sans-serif",
+            size=14,
+            color="black"
+        ),
+    )
 
-    #plt.figure(figsize=(7, 7))
-    #v = venn3(subsets=(len(A - B - C), len(B - A - C), len(A & B - C),
-    #                   len(C - A - B), len(A & C - B), len(B & C - A),
-    #                   len(A & B & C)),
-    #          set_labels=('ORCID', 'Lattes', 'OpenAlex'))
-    #plt.title("Cobertura de Publicações: ORCID vs. Lattes vs. OpenAlex")
-    #st.markdown("## Diagrama de Venn-Euler")
-    #st.pyplot(plt.gcf())
-    fig = create_venn_figure(A, B, C)
-    st.markdown("## Diagrama de Venn")
-    st.plotly_chart(fig)
+    # ✅ Streamlit: use_container_width -> width="stretch" (evita warning / compat futuro)
+    st.plotly_chart(sankey_fig, width="stretch")
 
+    # Venn
+    st.markdown("## Cobertura entre as bases")
+    all_report_rows = results["all_report_df"].to_dict(orient="records")
+    counts, total = compute_venn_counts_from_observations(all_report_rows)
+    venn_fig = create_venn_like_contarOverlap(
+        counts=counts,
+        total=total,
+        title="Cobertura: Lattes × ORCID × OpenAlex"
+    )
+    st.pyplot(venn_fig)
+    plt.close(venn_fig)
 
+    # Alerta: OpenAlex sem ORCID no Lattes
+    st.markdown("## Com OpenAlex, mas sem ORCID no Lattes (identificado por DOI)")
+    if results["options"].get("check_openalex_without_orcid", True):
+        if not results["warn_files_df"].empty:
+            st.dataframe(make_arrow_friendly(results["warn_files_df"]), width="stretch")
+            st.download_button(
+                label="Baixar CSV (arquivos sem ORCID, mas com OpenAlex via DOI)",
+                data=dataframe_to_csv_bytes(results["warn_files_df"]),
+                file_name="sem_orcid_mas_com_openalex_por_doi.csv",
+                mime="text/csv",
+                key="dl_warn_files"
+            )
 
-    ##############################
-    # RELATÓRIO CONSOLIDADO
-    ##############################
-    if all_report:
-        st.markdown("## Relatório Consolidado")
-        df = pd.DataFrame(all_report)
-        st.dataframe(df)
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Baixar relatório completo em CSV",
-            data=csv,
-            file_name="relatorio_consolidado.csv",
-            mime="text/csv"
-        )
+            if not results["warn_rows_df"].empty:
+                st.download_button(
+                    label="Baixar CSV (DOIs encontrados na OpenAlex sem ORCID no Lattes)",
+                    data=dataframe_to_csv_bytes(results["warn_rows_df"]),
+                    file_name="dois_openalex_sem_orcid_no_lattes.csv",
+                    mime="text/csv",
+                    key="dl_warn_rows"
+                )
+        else:
+            st.info("Nenhum caso encontrado (ou a opção de consulta por DOI está desativada).")
     else:
-        st.info("Nenhum dado consolidado para exibir.")
+        st.info("Ative a opção 'Verificar OpenAlex mesmo sem ORCID (por DOI)' para detectar estes casos.")
 
-footer_html = """<div style='text-align: center;'>
-  <p>Plataforma desenvolvida por Wellbar - 2025</p>
-</div>"""
-st.markdown(footer_html, unsafe_allow_html=True)
+    # Relatório consolidado
+    st.markdown("## Relatório Consolidado")
+    st.dataframe(make_arrow_friendly(results["all_report_df"]), width="stretch")
+    st.download_button(
+        label="Baixar relatório completo em CSV",
+        data=dataframe_to_csv_bytes(results["all_report_df"]),
+        file_name="relatorio_consolidado.csv",
+        mime="text/csv",
+        key="dl_all_report"
+    )
+
+st.markdown(
+    "<div style='text-align: center;'><p>Plataforma desenvolvida por Wellbar - 2026</p></div>",
+    unsafe_allow_html=True
+)
