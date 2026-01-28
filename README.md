@@ -172,10 +172,8 @@ O objetivo é facilitar leitura e comparação, mas o **vínculo principal de co
 
 ## Créditos
 
-<!--
 - **Desenvolvimento e responsabilidade técnica:** Wellington Barbosa Rodrigues  
 - **Concepção e orientação de domínio:** Rogério Mugnaini; Thamyres Vieira dos Santos
--->
 
 ---
 
