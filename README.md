@@ -177,6 +177,6 @@ O objetivo é facilitar leitura e comparação, mas o **vínculo principal de co
 
 ---
 
-## Como citar / referenciar o projeto (opcional)
+## Como citar / referenciar o projeto
 
 Se você utilizar o CesarAlex em um relatório, artigo ou produto acadêmico, você pode referenciar o repositório e a instância hospedada, destacando o uso para análise de interseção entre bases via identificadores persistentes (DOI/ORCID).
