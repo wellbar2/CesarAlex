@@ -58,7 +58,7 @@ st.sidebar.header("Opções")
 
 check_openalex_without_orcid = st.sidebar.checkbox(
     "Verificar OpenAlex mesmo sem ORCID (por DOI)",
-    value=True,
+    value=False,
     help="Se ativado, pode demorar muito mais porque o sistema consulta a OpenAlex para cada DOI individualmente."
 )
 
@@ -1213,3 +1213,4 @@ st.markdown(
     "<div style='text-align: center;'><p>Plataforma desenvolvida por Wellbar - 2026</p></div>",
     unsafe_allow_html=True
 )
+
