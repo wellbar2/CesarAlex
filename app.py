@@ -10,6 +10,7 @@ import re
 import time
 import csv
 import hashlib
+import unicodedata
 
 
 # =========================
@@ -20,6 +21,10 @@ OPENALEX_DOI_LOOKUP_RATE_LIMIT = 0.3      # pausa entre requisições por DOI (s
 OPENALEX_ORCID_RATE_LIMIT = 1.0           # pausa após consulta OpenAlex por ORCID (segundos)
 OPENALEX_PER_PAGE = 200                   # tamanho de página na OpenAlex (máx 200)
 OPENALEX_MAX_PAGES = 25                   # limite de páginas para evitar loops (200*25=5000 works)
+
+# Heurística de match (nomeLattes x autores OpenAlex do work)
+ENFORCE_OA_TOKENS_SUBSET_OF_LATTES = True
+MIN_COMMON_INITIALS_FALLBACK = 2
 
 
 # =========================
@@ -89,6 +94,22 @@ def extract_orcid_from_html(content: str):
         if "orcid.org" in href:
             return href.strip()
     return None
+
+
+def extract_nome_lattes_from_html(content: str) -> str:
+    """
+    Extrai o nome completo do pesquisador a partir do HTML do Lattes:
+    <h2 class="nome" tabindex="0">Laísa Soares Cardoso</h2>
+    """
+    try:
+        soup = BeautifulSoup(content, "html.parser")
+        h2 = soup.find("h2", class_="nome")
+        if h2:
+            nome = h2.get_text(" ", strip=True)
+            return nome if nome else "Não disponível"
+    except Exception:
+        pass
+    return "Não disponível"
 
 
 def extract_dois_from_lattes(content: str):
@@ -255,21 +276,220 @@ def get_publications_from_openalex_by_orcid(orcid_link: str):
     return pubs
 
 
+# =========================
+# Heurística (nomeLattes x autores do work OpenAlex)
+# =========================
+
+RE_WORD = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", flags=re.UNICODE)
+RE_INITIAL = re.compile(r"\b([A-Za-zÀ-ÖØ-öø-ÿ])\.\b|\b([A-Za-zÀ-ÖØ-öø-ÿ])\b", flags=re.UNICODE)
+
+STOP_TOKENS = {
+    "de", "da", "do", "das", "dos",
+    "del", "la", "las", "los", "el",
+    "y", "e",
+    "van", "von",
+}
+
+def strip_accents(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "")
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+def norm_text(s: str) -> str:
+    s = strip_accents(s or "")
+    s = s.casefold()
+
+    # trata nomes com hífen (e variações unicode) como separador de tokens
+    s = re.sub(r"[-‐-‒–—―]+", " ", s)
+
+    # mantém normalização de espaços
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def tokens_nome(nome: str) -> list[str]:
+    nome_n = norm_text(nome)
+    toks = [t for t in RE_WORD.findall(nome_n)]
+    toks = [t for t in toks if len(t) >= 2]
+    toks = [t for t in toks if t not in STOP_TOKENS]
+    return toks
+
+def initials_from_name(nome: str) -> set[str]:
+    nome_n = norm_text(nome)
+    toks = tokens_nome(nome_n)
+
+    inits = {t[0] for t in toks if t}
+    for m in RE_INITIAL.finditer(nome_n):
+        g = m.group(1) or m.group(2)
+        if g:
+            inits.add(norm_text(g)[0])
+    return inits
+
+
+def overlap_score(nome_lattes: str, nome_oa: str) -> int:
+    a = set(tokens_nome(nome_lattes))
+    b = set(tokens_nome(nome_oa))
+    return len(a.intersection(b))
+
+def fallback_1token_2initials(nome_lattes: str, nome_oa: str) -> tuple[bool, int]:
+    lt = set(tokens_nome(nome_lattes))
+    ot = set(tokens_nome(nome_oa))
+    if not lt or not ot:
+        return False, 0
+
+    common_tokens = lt.intersection(ot)
+    if len(common_tokens) < 1:
+        return False, 0
+
+    li = initials_from_name(nome_lattes)
+    oi = initials_from_name(nome_oa)
+    if len(li.intersection(oi)) < MIN_COMMON_INITIALS_FALLBACK:
+        return False, 0
+
+    return True, len(common_tokens)
+
+def oa_tokens_subset_of_lattes(nome_lattes: str, nome_oa: str) -> bool:
+    ls = set(tokens_nome(nome_lattes))
+    os = set(tokens_nome(nome_oa))
+    if not os:
+        return True
+    return os.issubset(ls)
+
+def _apply_subset_filter(nome_lattes: str, matches, enabled: bool):
+    if not enabled or not matches:
+        return matches
+    out = []
+    for m in matches:
+        oa_name = m[1]
+        # 1) tokens completos do OA devem estar no Lattes (opcional)
+        if not oa_tokens_subset_of_lattes(nome_lattes, oa_name):
+            continue
+        out.append(m)
+    return out
+
+
+def find_all_matches_nome(nome_lattes: str, autores: list[dict], min_common_tokens: int = 2):
+    # Regra principal: tokens>=2
+    best_by_id = {}
+
+    for a in autores:
+        oa_nome = (a.get("nome") or "").strip()
+        oa_id = (a.get("id_autor") or "").strip()
+        if not oa_nome or not oa_id:
+            continue
+
+        sc = overlap_score(nome_lattes, oa_nome)
+        if sc < min_common_tokens:
+            continue
+
+        if oa_id not in best_by_id:
+            best_by_id[oa_id] = (oa_nome, sc, "tokens>=2")
+        else:
+            nome_old, sc_old, _ = best_by_id[oa_id]
+            if sc > sc_old or (sc == sc_old and len(oa_nome) < len(nome_old)):
+                best_by_id[oa_id] = (oa_nome, sc, "tokens>=2")
+
+    matches = [(oid, onome, osc, met) for oid, (onome, osc, met) in best_by_id.items()]
+    matches.sort(key=lambda x: (-x[2], len(x[1]), norm_text(x[1]), x[0]))
+    matches = _apply_subset_filter(nome_lattes, matches, ENFORCE_OA_TOKENS_SUBSET_OF_LATTES)
+
+    if matches:
+        return matches
+
+    # Fallback: 1 token + 2 iniciais
+    fb_by_id = {}
+    for a in autores:
+        oa_nome = (a.get("nome") or "").strip()
+        oa_id = (a.get("id_autor") or "").strip()
+        if not oa_nome or not oa_id:
+            continue
+
+        ok, sc_fb = fallback_1token_2initials(nome_lattes, oa_nome)
+        if ok:
+            if oa_id not in fb_by_id:
+                fb_by_id[oa_id] = (oa_nome, sc_fb, "fallback_1token+2iniciais")
+            else:
+                nome_old, sc_old, _ = fb_by_id[oa_id]
+                if sc_fb > sc_old or (sc_fb == sc_old and len(oa_nome) < len(nome_old)):
+                    fb_by_id[oa_id] = (oa_nome, sc_fb, "fallback_1token+2iniciais")
+
+    fb = [(oid, onome, osc, met) for oid, (onome, osc, met) in fb_by_id.items()]
+    fb.sort(key=lambda x: (-x[2], len(x[1]), norm_text(x[1]), x[0]))
+    fb = _apply_subset_filter(nome_lattes, fb, ENFORCE_OA_TOKENS_SUBSET_OF_LATTES)
+    return fb
+
+def join_matches_for_cells(matches):
+    """
+    Retorna:
+      pairs_str: "A...|Nome; A...|Nome"
+      ids_str: "A...; A..."
+      nomes_str: "Nome; Nome"
+      metodos_str: "tokens>=2; fallback..."
+      scoremax: int
+    """
+    if not matches:
+        return "-", "-", "-", "-", 0
+    pairs = [f"{m[0]}|{m[1]}" for m in matches]
+    ids = [m[0] for m in matches]
+    nomes = [m[1] for m in matches]
+    metodos = [m[3] for m in matches]
+    scoremax = max(m[2] for m in matches)
+    return "; ".join(pairs), "; ".join(ids), "; ".join(nomes), "; ".join(metodos), scoremax
+
+
+# =========================
+# OpenAlex lookups (com autores)
+# =========================
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def openalex_author_lookup(author_id: str):
+    """
+    Busca detalhes do autor na OpenAlex (para obter ORCID quando não vem no authorship).
+    Retorna dict: {"found": bool, "orcid": str|None, "display_name": str|None}
+    """
+    if not author_id:
+        return {"found": False, "orcid": None, "display_name": None}
+
+    url = f"https://api.openalex.org/authors/{author_id.strip()}"
+    try:
+        resp = requests.get(url, timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
+    except Exception:
+        return {"found": False, "orcid": None, "display_name": None}
+
+    if resp.status_code != 200:
+        return {"found": False, "orcid": None, "display_name": None}
+
+    data = resp.json()
+    return {
+        "found": True,
+        "orcid": data.get("orcid"),
+        "display_name": data.get("display_name"),
+    }
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def openalex_lookup_by_doi(doi_norm: str):
-    """Consulta OpenAlex por DOI (normalizado). Cacheado para acelerar quando DOI repete."""
+    """
+    Consulta OpenAlex por DOI (normalizado). Cacheado para acelerar quando DOI repete.
+    Agora também retorna autores para aplicar heurística.
+    """
     if not doi_norm:
-        return {"found": False, "title": None, "year": None, "issn_l": None}
+        return {
+            "found": False,
+            "title": None,
+            "year": None,
+            "issn_l": None,
+            "authors": [],
+        }
 
     url = f"https://api.openalex.org/works/http://dx.doi.org/{doi_norm}"
 
     try:
         resp = requests.get(url, timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
     except Exception:
-        return {"found": False, "title": None, "year": None, "issn_l": None}
+        return {"found": False, "title": None, "year": None, "issn_l": None, "authors": []}
 
     if resp.status_code != 200:
-        return {"found": False, "title": None, "year": None, "issn_l": None}
+        return {"found": False, "title": None, "year": None, "issn_l": None, "authors": []}
 
     data = resp.json()
     title = data.get("display_name")
@@ -282,7 +502,26 @@ def openalex_lookup_by_doi(doi_norm: str):
         if isinstance(source, dict):
             issn_l = source.get("issn_l")
 
-    return {"found": True, "title": title, "year": year, "issn_l": issn_l}
+    # Autores (para heurística)
+    authors = []
+    authorships = data.get("authorships", [])
+    if isinstance(authorships, list):
+        for au in authorships:
+            if not isinstance(au, dict):
+                continue
+            a = au.get("author")
+            if not isinstance(a, dict):
+                continue
+            aid = (a.get("id") or "").strip()
+            # "id" às vezes vem como URL completa
+            if aid.startswith("https://openalex.org/"):
+                aid = aid.replace("https://openalex.org/", "").strip()
+            nome = (a.get("display_name") or "").strip()
+            orcid = (a.get("orcid") or "").strip() if a.get("orcid") else None
+            if aid and nome:
+                authors.append({"id_autor": aid, "nome": nome, "orcid": orcid})
+
+    return {"found": True, "title": title, "year": year, "issn_l": issn_l, "authors": authors}
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -331,13 +570,17 @@ def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
 
     df2 = df.copy()
 
-    # colunas que costumam misturar tipos (Ano, booleans, etc.)
-    for col in ["Ano", "Presente no Lattes", "Presente no ORCID", "Presente na OpenAlex"]:
+    # colunas que costumam misturar tipos
+    for col in ["Ano", "Presente no Lattes", "Presente no ORCID", "Presente na OpenAlex", "MatchScoreMax"]:
         if col in df2.columns:
             df2[col] = df2[col].astype(str)
 
     # colunas textuais (garante não virar NaN/float)
-    for col in ["Arquivo", "ORCID", "DOI", "Título", "ISSN-L", "Motivo", "Exemplos_DOI_OpenAlex"]:
+    for col in [
+        "Arquivo", "ORCID", "DOI", "Título", "ISSN-L", "Motivo", "Exemplos_DOI_OpenAlex",
+        "nomeLattes", "MatchPairs_OpenAlex", "IdsOpenAlex_Provaveis", "NomesOpenAlex_Provaveis",
+        "ORCIDs_Provaveis", "MetodoMatch"
+    ]:
         if col in df2.columns:
             df2[col] = df2[col].fillna("").astype(str)
 
@@ -505,6 +748,7 @@ process_clicked = st.button(
 if uploaded_files and not st.session_state["processed"]:
     st.info("Envie os currículos e clique em **Processar currículos** para iniciar o processamento.")
 
+
 # =========================
 # PROCESSAMENTO (roda 1x)
 # =========================
@@ -536,6 +780,9 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
             st.error(f"Erro ao ler {uploaded_file.name}: {e}")
             file_progress.progress(int((file_idx / total_files) * 100))
             continue
+
+        # Nome confiável do Lattes (para heurística)
+        nomeLattes = extract_nome_lattes_from_html(content)
 
         # Extração Lattes
         lattes_dois = extract_dois_from_lattes(content)
@@ -572,6 +819,14 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                 title_oa = None
                 year_oa = None
 
+                # Campos novos (heurística)
+                match_pairs = "-"
+                ids_prob = "-"
+                nomes_prob = "-"
+                orcids_prob = "-"
+                metodo_match = "-"
+                score_max = 0
+
                 if check_openalex_without_orcid:
                     lookup = openalex_lookup_by_doi(doi)
                     presente_openalex = bool(lookup.get("found", False))
@@ -581,6 +836,31 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                         issn_l = lookup.get("issn_l") or "Sem ISSN-L"
                         title_oa = lookup.get("title")
                         year_oa = lookup.get("year")
+
+                        # ---- heurística para identificar o autor dono do currículo ----
+                        autores_work = lookup.get("authors", []) or []
+                        matches = find_all_matches_nome(nomeLattes, autores_work, min_common_tokens=2)
+
+                        match_pairs, ids_prob, nomes_prob, metodo_match, score_max = join_matches_for_cells(matches)
+
+                        # ORCID(s) provável(is) para os ids encontrados
+                        orcid_list = []
+                        if matches:
+                            for (aid, anome, _, _) in matches:
+                                # 1) tenta ORCID já vindo no authorship
+                                orcid_direct = None
+                                for aw in autores_work:
+                                    if (aw.get("id_autor") or "").strip() == aid:
+                                        orcid_direct = aw.get("orcid")
+                                        break
+                                if orcid_direct:
+                                    orcid_list.append(orcid_direct)
+                                else:
+                                    # 2) fallback: consulta /authors/A...
+                                    au = openalex_author_lookup(aid)
+                                    orcid_list.append(au.get("orcid") or "-")
+                                time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
+                        orcids_prob = "; ".join(orcid_list) if orcid_list else "-"
 
                     if doi_progress and doi_status:
                         doi_status.write(f"Consultando OpenAlex por DOI: {i}/{n_dois}")
@@ -598,6 +878,7 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
 
                 consolidated_rows.append({
                     "Arquivo": uploaded_file.name,
+                    "nomeLattes": nomeLattes,
                     "ORCID": "Não disponível",
                     "DOI": doi,
                     "Título": title_final,
@@ -606,6 +887,14 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                     "Presente no ORCID": False,
                     "Presente na OpenAlex": presente_openalex,
                     "ISSN-L": issn_l,
+
+                    # Novos campos (heurística)
+                    "MatchPairs_OpenAlex": match_pairs,
+                    "IdsOpenAlex_Provaveis": ids_prob,
+                    "NomesOpenAlex_Provaveis": nomes_prob,
+                    "ORCIDs_Provaveis": orcids_prob,
+                    "MetodoMatch": metodo_match,
+                    "MatchScoreMax": score_max,
                 })
 
             if doi_progress:
@@ -625,16 +914,28 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                 )
                 no_orcid_but_openalex_files.append({
                     "Arquivo": uploaded_file.name,
+                    "nomeLattes": nomeLattes,
                     "Qtd_DOIs_Lattes": len(lattes_dois),
                     "Qtd_DOIs_encontrados_OpenAlex": len(found_in_openalex),
                     "Exemplos_DOI_OpenAlex": "; ".join(sample)
                 })
 
+                # Linhas detalhadas (agora enriquecidas com heurística)
                 for doi in found_in_openalex:
+                    # tenta recuperar a linha já construída (para reaproveitar campos de heurística)
+                    linha = next((r for r in consolidated_rows if r.get("DOI") == doi), None)
                     no_orcid_but_openalex_rows.append({
                         "Arquivo": uploaded_file.name,
+                        "nomeLattes": nomeLattes,
                         "DOI": doi,
-                        "Motivo": "OpenAlex encontrado por DOI, mas ORCID ausente no HTML do Lattes"
+                        "Motivo": "OpenAlex encontrado por DOI, mas ORCID ausente no HTML do Lattes",
+
+                        "MatchPairs_OpenAlex": (linha.get("MatchPairs_OpenAlex") if linha else "-"),
+                        "IdsOpenAlex_Provaveis": (linha.get("IdsOpenAlex_Provaveis") if linha else "-"),
+                        "NomesOpenAlex_Provaveis": (linha.get("NomesOpenAlex_Provaveis") if linha else "-"),
+                        "ORCIDs_Provaveis": (linha.get("ORCIDs_Provaveis") if linha else "-"),
+                        "MetodoMatch": (linha.get("MetodoMatch") if linha else "-"),
+                        "MatchScoreMax": (linha.get("MatchScoreMax") if linha else 0),
                     })
 
             file_progress.progress(int((file_idx / total_files) * 100))
@@ -662,10 +963,19 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
 
         # União de DOIs
         union_dois = set(lattes_dois) | set(orcid_dict.keys()) | set(openalex_dict.keys())
+        union_dois_list = sorted(union_dois)
+        n_union = len(union_dois_list)
+
+        # ✅ Barra de progresso para consulta por DOI (somente se checkbox estiver ativo)
+        doi_progress = None
+        doi_status = None
+        if check_openalex_without_orcid and n_union > 0:
+            doi_progress = st.progress(0)
+            doi_status = st.empty()
 
         consolidated_rows = []
-        for doi in sorted(union_dois):
-            row = {"Arquivo": uploaded_file.name, "ORCID": orcid_link, "DOI": doi}
+        for i, doi in enumerate(union_dois_list, start=1):
+            row = {"Arquivo": uploaded_file.name, "nomeLattes": nomeLattes, "ORCID": orcid_link, "DOI": doi}
 
             # prioridade Título/Ano: ORCID > Lattes > OpenAlex
             if doi in orcid_dict:
@@ -689,7 +999,65 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
             row["Presente na OpenAlex"] = (doi in openalex_dict)
             row["ISSN-L"] = openalex_dict[doi].get("ISSN-L", "Sem ISSN-L") if doi in openalex_dict else "Não disponível"
 
+            # Defaults da heurística (homogêneo)
+            row["MatchPairs_OpenAlex"] = "-"
+            row["IdsOpenAlex_Provaveis"] = "-"
+            row["NomesOpenAlex_Provaveis"] = "-"
+            row["ORCIDs_Provaveis"] = "-"
+            row["MetodoMatch"] = "-"
+            row["MatchScoreMax"] = 0
+
+            # ✅ Heurística (também para quem TEM ORCID), só se checkbox estiver ativo
+            if check_openalex_without_orcid and doi:
+                lookup = openalex_lookup_by_doi(doi)
+                if lookup.get("found", False):
+                    autores_work = lookup.get("authors", []) or []
+                    matches = find_all_matches_nome(nomeLattes, autores_work, min_common_tokens=2)
+
+                    match_pairs, ids_prob, nomes_prob, metodo_match, score_max = join_matches_for_cells(matches)
+
+                    # ORCID(s) provável(is) para os ids encontrados
+                    orcid_list = []
+                    if matches:
+                        for (aid, _, _, _) in matches:
+                            # 1) ORCID direto (authorships)
+                            orcid_direct = None
+                            for aw in autores_work:
+                                if (aw.get("id_autor") or "").strip() == aid:
+                                    orcid_direct = aw.get("orcid")
+                                    break
+
+                            if orcid_direct:
+                                orcid_list.append(orcid_direct)
+                            else:
+                                # 2) fallback: /authors/A...
+                                au = openalex_author_lookup(aid)
+                                orcid_list.append(au.get("orcid") or "-")
+
+                            time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
+
+                    row["MatchPairs_OpenAlex"] = match_pairs
+                    row["IdsOpenAlex_Provaveis"] = ids_prob
+                    row["NomesOpenAlex_Provaveis"] = nomes_prob
+                    row["ORCIDs_Provaveis"] = "; ".join(orcid_list) if orcid_list else "-"
+                    row["MetodoMatch"] = metodo_match
+                    row["MatchScoreMax"] = score_max
+
+                # mantém rate limit também entre DOIs
+                time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
+
+                # Atualiza barra
+                if doi_progress and doi_status:
+                    doi_status.write(f"Consultando OpenAlex por DOI: {i}/{n_union}")
+                    doi_progress.progress(int((i / n_union) * 100))
+
             consolidated_rows.append(row)
+
+        # Fecha barra
+        if doi_progress:
+            doi_progress.empty()
+        if doi_status:
+            doi_status.empty()
 
         df_file = pd.DataFrame(consolidated_rows)
         per_file_df[uploaded_file.name] = df_file
@@ -722,6 +1090,7 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
     }
     st.session_state["processed"] = True
     st.success("Processamento concluído. Agora você pode baixar os arquivos sem reprocessar.")
+
 
 # =========================
 # EXIBIÇÃO (reusa resultados)
@@ -816,6 +1185,7 @@ if st.session_state["processed"] and st.session_state["results"]:
             )
 
             if not results["warn_rows_df"].empty:
+                st.dataframe(make_arrow_friendly(results["warn_rows_df"]), width="stretch")
                 st.download_button(
                     label="Baixar CSV (DOIs encontrados na OpenAlex sem ORCID no Lattes)",
                     data=dataframe_to_csv_bytes(results["warn_rows_df"]),
