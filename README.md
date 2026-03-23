@@ -109,7 +109,7 @@ Esses arquivos ajudam a identificar situações em que **há sinais de presença
 
 ### Passo 1 — Exportar o Lattes em HTML
 1. Acesse o Currículo Lattes desejado
-2. Exporte/baixe o currículo em **HTML**
+2. Exporte/baixe o currículo em **HTML** (para grandes volumes recomenda-se o uso do scriptLattes)
 3. Salve o arquivo no seu computador
 
 Repita para quantos currículos quiser comparar.
