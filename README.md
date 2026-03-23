@@ -21,8 +21,11 @@ https://cesaralex-beta.streamlit.app/
 ## Instalação
 
 git clone https://github.com/wellbar2/CesarAlex.git
+
 cd CesarAlex
+
 pip install -r requirements.txt
+
 streamlit run app.py
 
 ---
