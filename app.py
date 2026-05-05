@@ -11,16 +11,20 @@ import time
 import csv
 import hashlib
 import unicodedata
+from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, List, Optional
 
 
 # =========================
 # CONSTANTES (ajustes internos)
 # =========================
-OPENALEX_DOI_LOOKUP_TIMEOUT = 20          # segundos
-OPENALEX_DOI_LOOKUP_RATE_LIMIT = 0.3      # pausa entre requisições por DOI (segundos)
-OPENALEX_ORCID_RATE_LIMIT = 1.0           # pausa após consulta OpenAlex por ORCID (segundos)
+OPENALEX_DOI_LOOKUP_TIMEOUT = 10          # segundos padrão = 10
+OPENALEX_DOI_LOOKUP_RATE_LIMIT = 0.3      # pausa entre requisições por DOI (segundos) padrão = 0.3
+OPENALEX_ORCID_RATE_LIMIT = 1.0           # pausa após consulta OpenAlex por ORCID (segundos) padrão = 1.0
 OPENALEX_PER_PAGE = 200                   # tamanho de página na OpenAlex (máx 200)
 OPENALEX_MAX_PAGES = 25                   # limite de páginas para evitar loops (200*25=5000 works)
+OPENALEX_MAX_RETRIES = 5                  # tentativas para erros transitórios
+OPENALEX_BACKOFF_BASE = 2.0               # base do backoff para 5xx/429 sem chave disponível
 
 # Heurística de match (nomeLattes x autores OpenAlex do work)
 ENFORCE_OA_TOKENS_SUBSET_OF_LATTES = True
@@ -56,6 +60,12 @@ Este aplicativo recebe arquivos de currículo Lattes (HTML) e, para cada um:
 # =========================
 st.sidebar.header("Opções")
 
+openalex_api_keys_text = st.sidebar.text_input(
+    "Chave OpenAlex",
+    value="",
+    type="password"
+)
+
 check_openalex_without_orcid = st.sidebar.checkbox(
     "Verificar OpenAlex mesmo sem ORCID (por DOI)",
     value=False,
@@ -63,10 +73,131 @@ check_openalex_without_orcid = st.sidebar.checkbox(
 )
 
 
+def parse_openalex_api_keys(keys_text: str) -> List[str]:
+    """Aceita uma chave única ou múltiplas chaves separadas por ponto e vírgula."""
+    return [k.strip() for k in (keys_text or "").split(";") if k and k.strip()]
+
+
+openalex_api_keys = parse_openalex_api_keys(openalex_api_keys_text)
+
+
+# =========================
+# CLIENTE OPENALEX COM ROTAÇÃO DE CHAVES
+# =========================
+class OpenAlexClient:
+    BASE_URL = "https://api.openalex.org"
+
+    def __init__(
+        self,
+        api_keys: List[str],
+        timeout: int = OPENALEX_DOI_LOOKUP_TIMEOUT,
+        max_retries: int = OPENALEX_MAX_RETRIES,
+        backoff_base: float = OPENALEX_BACKOFF_BASE,
+    ) -> None:
+        self.api_keys = [k.strip() for k in api_keys if k and k.strip()]
+        if not self.api_keys:
+            raise ValueError("Nenhuma chave OpenAlex foi informada.")
+
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self._idx_key = 0
+        self.last_error = ""
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "CesarAlex/2026"})
+
+    @property
+    def api_key_atual(self) -> str:
+        return self.api_keys[self._idx_key]
+
+    @property
+    def key_position_label(self) -> str:
+        return f"{self._idx_key + 1}/{len(self.api_keys)}"
+
+    def _avancar_api_key(self) -> bool:
+        if self._idx_key < len(self.api_keys) - 1:
+            self._idx_key += 1
+            return True
+        return False
+
+    def get_json(
+        self,
+        endpoint_or_url: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Faz GET na OpenAlex incluindo api_key.
+        Em HTTP 429, troca para a próxima chave disponível.
+        Em 5xx ou falha de rede, aplica retry com backoff.
+        """
+        if endpoint_or_url.startswith("http://") or endpoint_or_url.startswith("https://"):
+            url = endpoint_or_url
+        else:
+            url = f"{self.BASE_URL}/{endpoint_or_url.lstrip('/')}"
+
+        ultima_exc = None
+        timeout_final = timeout or self.timeout
+
+        for tentativa in range(1, self.max_retries + 1):
+            req_params = dict(params or {})
+            req_params["api_key"] = self.api_key_atual
+
+            try:
+                resp = self.session.get(url, params=req_params, timeout=timeout_final)
+
+                if resp.status_code == 200:
+                    self.last_error = ""
+                    return resp.json()
+
+                if resp.status_code == 429:
+                    if self._avancar_api_key():
+                        st.warning(
+                            f"Limite da chave OpenAlex atingido. "
+                            f"Alternando para a próxima chave ({self.key_position_label})."
+                        )
+                        time.sleep(1.0)
+                        continue
+
+                    espera = self.backoff_base ** (tentativa - 1)
+                    self.last_error = (
+                        f"OpenAlex retornou 429 e não há outra chave disponível. "
+                        f"Tentativa {tentativa}/{self.max_retries}."
+                    )
+                    time.sleep(espera)
+                    continue
+
+                if 500 <= resp.status_code < 600:
+                    espera = self.backoff_base ** (tentativa - 1)
+                    self.last_error = (
+                        f"Erro transitório OpenAlex {resp.status_code}. "
+                        f"Tentativa {tentativa}/{self.max_retries}."
+                    )
+                    time.sleep(espera)
+                    continue
+
+                self.last_error = f"Erro OpenAlex HTTP {resp.status_code}: {resp.text[:500]}"
+                return None
+
+            except requests.RequestException as e:
+                ultima_exc = e
+                espera = self.backoff_base ** (tentativa - 1)
+                self.last_error = (
+                    f"Falha de rede/requisição na OpenAlex: {e}. "
+                    f"Tentativa {tentativa}/{self.max_retries}."
+                )
+                time.sleep(espera)
+
+        if ultima_exc:
+            self.last_error = f"Falha final na OpenAlex: {ultima_exc}"
+        elif not self.last_error:
+            self.last_error = "Falha final na OpenAlex após todas as tentativas."
+        return None
+
+
 # =========================
 # HELPERS
 # =========================
-
 def normalize_doi(doi: str):
     """Normaliza DOI para comparação: remove prefixos e coloca em minúsculo."""
     if not doi:
@@ -127,9 +258,69 @@ def extract_dois_from_lattes(content: str):
     return dois
 
 
+def extract_title_from_lattes_article(link) -> str:
+    """
+    Extrai o título limpo de uma publicação do Lattes a partir do link de DOI.
+
+    Estratégia principal:
+    - quando existe o span de citação do Lattes, o atributo cvuri geralmente traz
+      o parâmetro titulo=..., que já corresponde ao título exato da publicação.
+
+    Fallback:
+    - limpa elementos auxiliares do bloco da produção e remove a parte de autores
+      antes do padrão " . ". Se o padrão não for encontrado, devolve o texto limpo
+      do bloco, preservando o comportamento anterior.
+    """
+    bloco = link.find_parent("span", class_="transform") or link.find_parent()
+    if not bloco:
+        return "Não disponível"
+
+    citado = bloco.find("span", class_="citado")
+    if citado:
+        cvuri = citado.get("cvuri", "")
+        if cvuri and "titulo=" in cvuri:
+            try:
+                qs = parse_qs(urlparse(cvuri).query)
+                titulo = (qs.get("titulo") or [""])[0].strip()
+                if titulo:
+                    return titulo
+            except Exception:
+                pass
+
+    bloco_limpo = BeautifulSoup(str(bloco), "html.parser")
+
+    for tag in bloco_limpo.find_all("span", class_="informacao-artigo"):
+        tag.decompose()
+    for tag in bloco_limpo.find_all("a", class_="icone-producao icone-doi"):
+        tag.decompose()
+    for tag in bloco_limpo.find_all("span", class_="citado"):
+        tag.decompose()
+    for tag in bloco_limpo.find_all("sup"):
+        tag.decompose()
+
+    texto = bloco_limpo.get_text(" ", strip=True)
+    texto = re.sub(r"\s+", " ", texto).strip()
+
+    # Formato típico do Lattes: AUTORES . Título. Periódico, v. ..., ano.
+    if " . " in texto:
+        texto_pos_autores = texto.split(" . ", 1)[1].strip()
+    else:
+        texto_pos_autores = texto
+
+    # Remove a parte bibliográfica mais comum quando possível.
+    # Evita ser agressivo demais, pois alguns títulos contêm ponto.
+    m = re.match(r"^(.+?)\.\s+[^.]*,\s*(v\.|p\.|n\.|ano|202?\d|19\d{2})", texto_pos_autores, flags=re.IGNORECASE)
+    if m:
+        titulo = m.group(1).strip()
+        if titulo:
+            return titulo
+
+    return texto_pos_autores or texto or "Não disponível"
+
+
 def extract_articles_info_from_lattes(content: str):
     """
-    Extrai informações do item (texto do bloco) e tenta achar um ano (19xx/20xx).
+    Extrai informações dos artigos com DOI no HTML do Lattes.
     Retorna dict: {doi: {"Título": ..., "Ano": ...}}
     """
     soup = BeautifulSoup(content, "html.parser")
@@ -140,11 +331,11 @@ def extract_articles_info_from_lattes(content: str):
         if not doi_norm:
             continue
 
-        parent = link.find_parent()
+        parent = link.find_parent("span", class_="transform") or link.find_parent()
         parent_text = parent.get_text(" ", strip=True) if parent else ""
         match = re.search(r"\b(19|20)\d{2}\b", parent_text)
         year = match.group(0) if match else "Não disponível"
-        title = parent_text if parent_text else "Não disponível"
+        title = extract_title_from_lattes_article(link)
 
         articles[doi_norm] = {"Título": title, "Ano": year}
     return articles
@@ -208,9 +399,34 @@ def get_publications_from_orcid(orcid_link: str):
     return pubs
 
 
-def get_publications_from_openalex_by_orcid(orcid_link: str):
+def extract_authors_from_openalex_work(work: Dict[str, Any]) -> List[Dict[str, Any]]:
+    authors = []
+    authorships = work.get("authorships", [])
+    if isinstance(authorships, list):
+        for au in authorships:
+            if not isinstance(au, dict):
+                continue
+            a = au.get("author")
+            if not isinstance(a, dict):
+                continue
+
+            aid = (a.get("id") or "").strip()
+            if aid.startswith("https://openalex.org/"):
+                aid = aid.replace("https://openalex.org/", "").strip()
+
+            nome = (a.get("display_name") or "").strip()
+            orcid = (a.get("orcid") or "").strip() if a.get("orcid") else None
+
+            if aid and nome:
+                authors.append({"id_autor": aid, "nome": nome, "orcid": orcid})
+    return authors
+
+
+def get_publications_from_openalex_by_orcid(orcid_link: str, client: OpenAlexClient):
     """
-    Consulta OpenAlex por ORCID e retorna lista com Título, Ano, DOI(normalizado), ISSN-L.
+    Consulta OpenAlex por ORCID e retorna lista com:
+      - Título, Ano, DOI(normalizado), ISSN-L
+      - authors: lista [{id_autor, nome, orcid}]
     Implementa paginação (cursor) para não truncar em 200 works.
     """
     if not orcid_link:
@@ -229,24 +445,17 @@ def get_publications_from_openalex_by_orcid(orcid_link: str):
     pages = 0
 
     while pages < OPENALEX_MAX_PAGES:
-        url = (
-            "https://api.openalex.org/works"
-            f"?filter=authorships.author.orcid:{orcid_id}"
-            f"&per_page={OPENALEX_PER_PAGE}"
-            f"&cursor={cursor}"
-        )
+        params = {
+            "filter": f"authorships.author.orcid:{orcid_id}",
+            "per_page": OPENALEX_PER_PAGE,
+            "cursor": cursor,
+        }
 
-        try:
-            resp = requests.get(url, timeout=30)
-        except Exception:
-            st.error(f"Falha ao acessar OpenAlex para ORCID {orcid_id}.")
+        data = client.get_json("works", params=params, timeout=30)
+        if data is None:
+            st.error(f"Erro OpenAlex para ORCID {orcid_id}. {client.last_error}")
             break
 
-        if resp.status_code != 200:
-            st.error(f"Erro OpenAlex para ORCID {orcid_id}. Código: {resp.status_code}")
-            break
-
-        data = resp.json()
         results = data.get("results", [])
         if not results:
             break
@@ -263,7 +472,13 @@ def get_publications_from_openalex_by_orcid(orcid_link: str):
                 if isinstance(source, dict):
                     issn_l = source.get("issn_l", "Sem ISSN-L") or "Sem ISSN-L"
 
-            pubs.append({"Título": title, "Ano": year, "DOI": doi_norm, "ISSN-L": issn_l})
+            pubs.append({
+                "Título": title,
+                "Ano": year,
+                "DOI": doi_norm,
+                "ISSN-L": issn_l,
+                "authors": extract_authors_from_openalex_work(work),
+            })
 
         meta = data.get("meta", {})
         next_cursor = meta.get("next_cursor")
@@ -279,7 +494,6 @@ def get_publications_from_openalex_by_orcid(orcid_link: str):
 # =========================
 # Heurística (nomeLattes x autores do work OpenAlex)
 # =========================
-
 RE_WORD = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", flags=re.UNICODE)
 RE_INITIAL = re.compile(r"\b([A-Za-zÀ-ÖØ-öø-ÿ])\.\b|\b([A-Za-zÀ-ÖØ-öø-ÿ])\b", flags=re.UNICODE)
 
@@ -290,18 +504,16 @@ STOP_TOKENS = {
     "van", "von",
 }
 
+
 def strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFKD", s or "")
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 
+
 def norm_text(s: str) -> str:
     s = strip_accents(s or "")
     s = s.casefold()
-
-    # trata nomes com hífen (e variações unicode) como separador de tokens
     s = re.sub(r"[-‐-‒–—―]+", " ", s)
-
-    # mantém normalização de espaços
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -313,10 +525,10 @@ def tokens_nome(nome: str) -> list[str]:
     toks = [t for t in toks if t not in STOP_TOKENS]
     return toks
 
+
 def initials_from_name(nome: str) -> set[str]:
     nome_n = norm_text(nome)
     toks = tokens_nome(nome_n)
-
     inits = {t[0] for t in toks if t}
     for m in RE_INITIAL.finditer(nome_n):
         g = m.group(1) or m.group(2)
@@ -329,6 +541,7 @@ def overlap_score(nome_lattes: str, nome_oa: str) -> int:
     a = set(tokens_nome(nome_lattes))
     b = set(tokens_nome(nome_oa))
     return len(a.intersection(b))
+
 
 def fallback_1token_2initials(nome_lattes: str, nome_oa: str) -> tuple[bool, int]:
     lt = set(tokens_nome(nome_lattes))
@@ -347,6 +560,7 @@ def fallback_1token_2initials(nome_lattes: str, nome_oa: str) -> tuple[bool, int
 
     return True, len(common_tokens)
 
+
 def oa_tokens_subset_of_lattes(nome_lattes: str, nome_oa: str) -> bool:
     ls = set(tokens_nome(nome_lattes))
     os = set(tokens_nome(nome_oa))
@@ -354,13 +568,13 @@ def oa_tokens_subset_of_lattes(nome_lattes: str, nome_oa: str) -> bool:
         return True
     return os.issubset(ls)
 
+
 def _apply_subset_filter(nome_lattes: str, matches, enabled: bool):
     if not enabled or not matches:
         return matches
     out = []
     for m in matches:
         oa_name = m[1]
-        # 1) tokens completos do OA devem estar no Lattes (opcional)
         if not oa_tokens_subset_of_lattes(nome_lattes, oa_name):
             continue
         out.append(m)
@@ -368,7 +582,6 @@ def _apply_subset_filter(nome_lattes: str, matches, enabled: bool):
 
 
 def find_all_matches_nome(nome_lattes: str, autores: list[dict], min_common_tokens: int = 2):
-    # Regra principal: tokens>=2
     best_by_id = {}
 
     for a in autores:
@@ -395,7 +608,6 @@ def find_all_matches_nome(nome_lattes: str, autores: list[dict], min_common_toke
     if matches:
         return matches
 
-    # Fallback: 1 token + 2 iniciais
     fb_by_id = {}
     for a in autores:
         oa_nome = (a.get("nome") or "").strip()
@@ -417,6 +629,7 @@ def find_all_matches_nome(nome_lattes: str, autores: list[dict], min_common_toke
     fb = _apply_subset_filter(nome_lattes, fb, ENFORCE_OA_TOKENS_SUBSET_OF_LATTES)
     return fb
 
+
 def join_matches_for_cells(matches):
     """
     Retorna:
@@ -437,11 +650,9 @@ def join_matches_for_cells(matches):
 
 
 # =========================
-# OpenAlex lookups (com autores)
+# OpenAlex lookups (com autores) - usando cache manual por processamento
 # =========================
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def openalex_author_lookup(author_id: str):
+def openalex_author_lookup(author_id: str, client: OpenAlexClient, author_cache: Dict[str, Dict[str, Any]]):
     """
     Busca detalhes do autor na OpenAlex (para obter ORCID quando não vem no authorship).
     Retorna dict: {"found": bool, "orcid": str|None, "display_name": str|None}
@@ -449,79 +660,92 @@ def openalex_author_lookup(author_id: str):
     if not author_id:
         return {"found": False, "orcid": None, "display_name": None}
 
-    url = f"https://api.openalex.org/authors/{author_id.strip()}"
-    try:
-        resp = requests.get(url, timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
-    except Exception:
-        return {"found": False, "orcid": None, "display_name": None}
+    author_id = author_id.strip()
+    if author_id in author_cache:
+        return author_cache[author_id]
 
-    if resp.status_code != 200:
-        return {"found": False, "orcid": None, "display_name": None}
-
-    data = resp.json()
-    return {
-        "found": True,
-        "orcid": data.get("orcid"),
-        "display_name": data.get("display_name"),
-    }
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def openalex_lookup_by_doi(doi_norm: str):
-    """
-    Consulta OpenAlex por DOI (normalizado). Cacheado para acelerar quando DOI repete.
-    Agora também retorna autores para aplicar heurística.
-    """
-    if not doi_norm:
-        return {
-            "found": False,
-            "title": None,
-            "year": None,
-            "issn_l": None,
-            "authors": [],
+    data = client.get_json(f"authors/{author_id}", timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
+    if data is None:
+        out = {"found": False, "orcid": None, "display_name": None}
+    else:
+        out = {
+            "found": True,
+            "orcid": data.get("orcid"),
+            "display_name": data.get("display_name"),
         }
 
-    url = f"https://api.openalex.org/works/http://dx.doi.org/{doi_norm}"
+    author_cache[author_id] = out
+    return out
 
-    try:
-        resp = requests.get(url, timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
-    except Exception:
-        return {"found": False, "title": None, "year": None, "issn_l": None, "authors": []}
 
-    if resp.status_code != 200:
-        return {"found": False, "title": None, "year": None, "issn_l": None, "authors": []}
+def openalex_lookup_by_doi(doi_norm: str, client: OpenAlexClient, doi_cache: Dict[str, Dict[str, Any]]):
+    """
+    Consulta OpenAlex por DOI (normalizado). Cache manual para acelerar quando DOI repete.
+    Também retorna autores para aplicar heurística.
+    """
+    empty = {
+        "found": False,
+        "title": None,
+        "year": None,
+        "issn_l": None,
+        "authors": [],
+    }
 
-    data = resp.json()
-    title = data.get("display_name")
-    year = data.get("publication_year")
+    if not doi_norm:
+        return empty
 
-    issn_l = None
-    primary_location = data.get("primary_location")
-    if isinstance(primary_location, dict):
-        source = primary_location.get("source")
-        if isinstance(source, dict):
-            issn_l = source.get("issn_l")
+    doi_norm = doi_norm.strip()
+    if doi_norm in doi_cache:
+        return doi_cache[doi_norm]
 
-    # Autores (para heurística)
-    authors = []
-    authorships = data.get("authorships", [])
-    if isinstance(authorships, list):
-        for au in authorships:
-            if not isinstance(au, dict):
-                continue
-            a = au.get("author")
-            if not isinstance(a, dict):
-                continue
-            aid = (a.get("id") or "").strip()
-            # "id" às vezes vem como URL completa
-            if aid.startswith("https://openalex.org/"):
-                aid = aid.replace("https://openalex.org/", "").strip()
-            nome = (a.get("display_name") or "").strip()
-            orcid = (a.get("orcid") or "").strip() if a.get("orcid") else None
-            if aid and nome:
-                authors.append({"id_autor": aid, "nome": nome, "orcid": orcid})
+    endpoint = f"works/http://dx.doi.org/{doi_norm}"
+    data = client.get_json(endpoint, timeout=OPENALEX_DOI_LOOKUP_TIMEOUT)
 
-    return {"found": True, "title": title, "year": year, "issn_l": issn_l, "authors": authors}
+    if data is None:
+        out = empty
+    else:
+        title = data.get("display_name")
+        year = data.get("publication_year")
+
+        issn_l = None
+        primary_location = data.get("primary_location")
+        if isinstance(primary_location, dict):
+            source = primary_location.get("source")
+            if isinstance(source, dict):
+                issn_l = source.get("issn_l")
+
+        out = {
+            "found": True,
+            "title": title,
+            "year": year,
+            "issn_l": issn_l,
+            "authors": extract_authors_from_openalex_work(data),
+        }
+
+    doi_cache[doi_norm] = out
+    return out
+
+
+def get_orcids_for_matches(matches, autores_work, client: OpenAlexClient, author_cache: Dict[str, Dict[str, Any]]) -> str:
+    orcid_list = []
+    if not matches:
+        return "-"
+
+    for (aid, _, _, _) in matches:
+        orcid_direct = None
+        for aw in autores_work:
+            if (aw.get("id_autor") or "").strip() == aid:
+                orcid_direct = aw.get("orcid")
+                break
+
+        if orcid_direct:
+            orcid_list.append(orcid_direct)
+        else:
+            au = openalex_author_lookup(aid, client, author_cache)
+            orcid_list.append(au.get("orcid") or "-")
+            time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
+
+    return "; ".join(orcid_list) if orcid_list else "-"
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -546,7 +770,7 @@ def files_fingerprint(uploaded_files) -> str:
     """
     h = hashlib.sha256()
     for f in uploaded_files:
-        data = f.getvalue()  # bytes
+        data = f.getvalue()
         h.update(f.name.encode("utf-8"))
         h.update(str(len(data)).encode("utf-8"))
         h.update(hashlib.sha256(data).digest())
@@ -570,12 +794,10 @@ def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
 
     df2 = df.copy()
 
-    # colunas que costumam misturar tipos
     for col in ["Ano", "Presente no Lattes", "Presente no ORCID", "Presente na OpenAlex", "MatchScoreMax"]:
         if col in df2.columns:
             df2[col] = df2[col].astype(str)
 
-    # colunas textuais (garante não virar NaN/float)
     for col in [
         "Arquivo", "ORCID", "DOI", "Título", "ISSN-L", "Motivo", "Exemplos_DOI_OpenAlex",
         "nomeLattes", "MatchPairs_OpenAlex", "IdsOpenAlex_Provaveis", "NomesOpenAlex_Provaveis",
@@ -588,7 +810,6 @@ def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ===== VENN (como contarOverlapPorPeriodo) - por observação =====
-
 def venn_category_for_row(presente_lattes, presente_orcid, presente_openalex):
     l = bool(presente_lattes)
     o = bool(presente_orcid)
@@ -635,13 +856,13 @@ def compute_venn_counts_from_observations(all_report_rows):
 
 def create_venn_like_contarOverlap(counts, total, title):
     subsets = (
-        counts["Lattes_Apenas"],            # 100
-        counts["ORCID_Apenas"],             # 010
-        counts["Lattes_ORCID_Apenas"],      # 110
-        counts["OpenAlex_Apenas"],          # 001
-        counts["Lattes_OpenAlex_Apenas"],   # 101
-        counts["ORCID_OpenAlex_Apenas"],    # 011
-        counts["Lattes_ORCID_OpenAlex"],    # 111
+        counts["Lattes_Apenas"],
+        counts["ORCID_Apenas"],
+        counts["Lattes_ORCID_Apenas"],
+        counts["OpenAlex_Apenas"],
+        counts["Lattes_OpenAlex_Apenas"],
+        counts["ORCID_OpenAlex_Apenas"],
+        counts["Lattes_ORCID_OpenAlex"],
     )
 
     cor_lattes = "#009B3A"
@@ -742,10 +963,13 @@ if current_fp and st.session_state["fingerprint"] != current_fp:
 process_clicked = st.button(
     "Processar currículos",
     type="primary",
-    disabled=(not uploaded_files)
+    disabled=(not uploaded_files or not openalex_api_keys)
 )
 
-if uploaded_files and not st.session_state["processed"]:
+if uploaded_files and not openalex_api_keys:
+    st.warning("Informe a chave OpenAlex no menu lateral para iniciar o processamento.")
+
+if uploaded_files and openalex_api_keys and not st.session_state["processed"]:
     st.info("Envie os currículos e clique em **Processar currículos** para iniciar o processamento.")
 
 
@@ -753,6 +977,16 @@ if uploaded_files and not st.session_state["processed"]:
 # PROCESSAMENTO (roda 1x)
 # =========================
 if uploaded_files and process_clicked and not st.session_state["processed"]:
+    try:
+        openalex_client = OpenAlexClient(api_keys=openalex_api_keys)
+    except ValueError as e:
+        st.error(str(e))
+        st.stop()
+
+    # caches manuais válidos durante este processamento
+    openalex_doi_cache = {}
+    openalex_author_cache = {}
+
     # Contadores para Sankey
     files_with_orcid = 0
     files_without_orcid = 0
@@ -828,7 +1062,7 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                 score_max = 0
 
                 if check_openalex_without_orcid:
-                    lookup = openalex_lookup_by_doi(doi)
+                    lookup = openalex_lookup_by_doi(doi, openalex_client, openalex_doi_cache)
                     presente_openalex = bool(lookup.get("found", False))
 
                     if presente_openalex:
@@ -837,30 +1071,16 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                         title_oa = lookup.get("title")
                         year_oa = lookup.get("year")
 
-                        # ---- heurística para identificar o autor dono do currículo ----
                         autores_work = lookup.get("authors", []) or []
                         matches = find_all_matches_nome(nomeLattes, autores_work, min_common_tokens=2)
 
                         match_pairs, ids_prob, nomes_prob, metodo_match, score_max = join_matches_for_cells(matches)
-
-                        # ORCID(s) provável(is) para os ids encontrados
-                        orcid_list = []
-                        if matches:
-                            for (aid, anome, _, _) in matches:
-                                # 1) tenta ORCID já vindo no authorship
-                                orcid_direct = None
-                                for aw in autores_work:
-                                    if (aw.get("id_autor") or "").strip() == aid:
-                                        orcid_direct = aw.get("orcid")
-                                        break
-                                if orcid_direct:
-                                    orcid_list.append(orcid_direct)
-                                else:
-                                    # 2) fallback: consulta /authors/A...
-                                    au = openalex_author_lookup(aid)
-                                    orcid_list.append(au.get("orcid") or "-")
-                                time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
-                        orcids_prob = "; ".join(orcid_list) if orcid_list else "-"
+                        orcids_prob = get_orcids_for_matches(
+                            matches,
+                            autores_work,
+                            openalex_client,
+                            openalex_author_cache,
+                        )
 
                     if doi_progress and doi_status:
                         doi_status.write(f"Consultando OpenAlex por DOI: {i}/{n_dois}")
@@ -868,7 +1088,6 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
 
                     time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
 
-                # Prioridade Título/Ano (sem ORCID): Lattes > OpenAlex(lookup)
                 title_final = info.get("Título", "Não disponível")
                 year_final = info.get("Ano", "Não disponível")
                 if (title_final in ["Não disponível", "", None]) and title_oa:
@@ -888,7 +1107,6 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                     "Presente na OpenAlex": presente_openalex,
                     "ISSN-L": issn_l,
 
-                    # Novos campos (heurística)
                     "MatchPairs_OpenAlex": match_pairs,
                     "IdsOpenAlex_Provaveis": ids_prob,
                     "NomesOpenAlex_Provaveis": nomes_prob,
@@ -920,9 +1138,7 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                     "Exemplos_DOI_OpenAlex": "; ".join(sample)
                 })
 
-                # Linhas detalhadas (agora enriquecidas com heurística)
                 for doi in found_in_openalex:
-                    # tenta recuperar a linha já construída (para reaproveitar campos de heurística)
                     linha = next((r for r in consolidated_rows if r.get("DOI") == doi), None)
                     no_orcid_but_openalex_rows.append({
                         "Arquivo": uploaded_file.name,
@@ -952,7 +1168,7 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
         orcid_dict = {p["DOI"]: p for p in orcid_pubs if p.get("DOI")}
 
         # OpenAlex API por ORCID (paginado)
-        openalex_pubs = get_publications_from_openalex_by_orcid(orcid_link)
+        openalex_pubs = get_publications_from_openalex_by_orcid(orcid_link, openalex_client)
         time.sleep(OPENALEX_ORCID_RATE_LIMIT)
         openalex_dict = {p["DOI"]: p for p in openalex_pubs if p.get("DOI")}
 
@@ -961,12 +1177,10 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
         else:
             files_without_openalex_count += 1
 
-        # União de DOIs
         union_dois = set(lattes_dois) | set(orcid_dict.keys()) | set(openalex_dict.keys())
         union_dois_list = sorted(union_dois)
         n_union = len(union_dois_list)
 
-        # ✅ Barra de progresso para consulta por DOI (somente se checkbox estiver ativo)
         doi_progress = None
         doi_status = None
         if check_openalex_without_orcid and n_union > 0:
@@ -977,7 +1191,6 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
         for i, doi in enumerate(union_dois_list, start=1):
             row = {"Arquivo": uploaded_file.name, "nomeLattes": nomeLattes, "ORCID": orcid_link, "DOI": doi}
 
-            # prioridade Título/Ano: ORCID > Lattes > OpenAlex
             if doi in orcid_dict:
                 row["Título"] = orcid_dict[doi].get("Título", "Sem título")
                 row["Ano"] = orcid_dict[doi].get("Ano", "Sem data")
@@ -999,7 +1212,6 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
             row["Presente na OpenAlex"] = (doi in openalex_dict)
             row["ISSN-L"] = openalex_dict[doi].get("ISSN-L", "Sem ISSN-L") if doi in openalex_dict else "Não disponível"
 
-            # Defaults da heurística (homogêneo)
             row["MatchPairs_OpenAlex"] = "-"
             row["IdsOpenAlex_Provaveis"] = "-"
             row["NomesOpenAlex_Provaveis"] = "-"
@@ -1007,53 +1219,41 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
             row["MetodoMatch"] = "-"
             row["MatchScoreMax"] = 0
 
-            # ✅ Heurística (também para quem TEM ORCID), só se checkbox estiver ativo
+            # Heurística também para quem TEM ORCID, somente se checkbox estiver ativo
             if check_openalex_without_orcid and doi:
-                lookup = openalex_lookup_by_doi(doi)
-                if lookup.get("found", False):
-                    autores_work = lookup.get("authors", []) or []
+                autores_work = []
+
+                if doi in openalex_dict:
+                    autores_work = openalex_dict[doi].get("authors", []) or []
+
+                if not autores_work:
+                    lookup = openalex_lookup_by_doi(doi, openalex_client, openalex_doi_cache)
+                    if lookup.get("found", False):
+                        autores_work = lookup.get("authors", []) or []
+                    time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
+
+                if autores_work:
                     matches = find_all_matches_nome(nomeLattes, autores_work, min_common_tokens=2)
-
                     match_pairs, ids_prob, nomes_prob, metodo_match, score_max = join_matches_for_cells(matches)
-
-                    # ORCID(s) provável(is) para os ids encontrados
-                    orcid_list = []
-                    if matches:
-                        for (aid, _, _, _) in matches:
-                            # 1) ORCID direto (authorships)
-                            orcid_direct = None
-                            for aw in autores_work:
-                                if (aw.get("id_autor") or "").strip() == aid:
-                                    orcid_direct = aw.get("orcid")
-                                    break
-
-                            if orcid_direct:
-                                orcid_list.append(orcid_direct)
-                            else:
-                                # 2) fallback: /authors/A...
-                                au = openalex_author_lookup(aid)
-                                orcid_list.append(au.get("orcid") or "-")
-
-                            time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
 
                     row["MatchPairs_OpenAlex"] = match_pairs
                     row["IdsOpenAlex_Provaveis"] = ids_prob
                     row["NomesOpenAlex_Provaveis"] = nomes_prob
-                    row["ORCIDs_Provaveis"] = "; ".join(orcid_list) if orcid_list else "-"
+                    row["ORCIDs_Provaveis"] = get_orcids_for_matches(
+                        matches,
+                        autores_work,
+                        openalex_client,
+                        openalex_author_cache,
+                    )
                     row["MetodoMatch"] = metodo_match
                     row["MatchScoreMax"] = score_max
 
-                # mantém rate limit também entre DOIs
-                time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
-
-                # Atualiza barra
                 if doi_progress and doi_status:
                     doi_status.write(f"Consultando OpenAlex por DOI: {i}/{n_union}")
                     doi_progress.progress(int((i / n_union) * 100))
 
             consolidated_rows.append(row)
 
-        # Fecha barra
         if doi_progress:
             doi_progress.empty()
         if doi_status:
@@ -1156,7 +1356,6 @@ if st.session_state["processed"] and st.session_state["results"]:
         ),
     )
 
-    # ✅ Streamlit: use_container_width -> width="stretch" (evita warning / compat futuro)
     st.plotly_chart(sankey_fig, width="stretch")
 
     # Venn
@@ -1213,4 +1412,3 @@ st.markdown(
     "<div style='text-align: center;'><p>Plataforma desenvolvida por Wellbar - 2026</p></div>",
     unsafe_allow_html=True
 )
-
