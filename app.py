@@ -490,6 +490,120 @@ def get_publications_from_openalex_by_orcid(orcid_link: str, client: OpenAlexCli
 
     return pubs
 
+def get_publications_from_openalex_by_author_id(author_id: str, client: OpenAlexClient):
+    """
+    Consulta OpenAlex por author_id e retorna obras do perfil.
+    Usada como cache inteligente para pesquisadores sem ORCID.
+    """
+    if not author_id:
+        return []
+
+    author_id = author_id.strip()
+    if author_id.startswith("https://openalex.org/"):
+        author_id = author_id.replace("https://openalex.org/", "").strip()
+
+    pubs = []
+    cursor = "*"
+    pages = 0
+
+    while pages < OPENALEX_MAX_PAGES:
+        params = {
+            "filter": f"authorships.author.id:{author_id}",
+            "per_page": OPENALEX_PER_PAGE,
+            "cursor": cursor,
+        }
+
+        data = client.get_json("works", params=params, timeout=30)
+        if data is None:
+            st.error(f"Erro OpenAlex para author_id {author_id}. {client.last_error}")
+            break
+
+        results = data.get("results", [])
+        if not results:
+            break
+
+        for work in results:
+            doi_norm = normalize_doi(work.get("doi")) if work.get("doi") else None
+            title = work.get("display_name", "Sem título") or "Sem título"
+            year = work.get("publication_year", "Sem data")
+
+            issn_l = "Sem ISSN-L"
+            primary_location = work.get("primary_location")
+            if isinstance(primary_location, dict):
+                source = primary_location.get("source")
+                if isinstance(source, dict):
+                    issn_l = source.get("issn_l", "Sem ISSN-L") or "Sem ISSN-L"
+
+            pubs.append({
+                "Título": title,
+                "Ano": year,
+                "DOI": doi_norm,
+                "ISSN-L": issn_l,
+                "authors": extract_authors_from_openalex_work(work),
+                "author_id_perfil": author_id,
+            })
+
+        next_cursor = data.get("meta", {}).get("next_cursor")
+        if not next_cursor:
+            break
+
+        cursor = next_cursor
+        pages += 1
+
+    return pubs
+
+
+def build_openalex_profile_dict(pubs: list[dict]) -> Dict[str, dict]:
+    """
+    Indexa obras de um perfil OpenAlex por DOI.
+    """
+    return {
+        p["DOI"]: p
+        for p in pubs
+        if p.get("DOI")
+    }
+
+
+def find_doi_in_inferred_profiles(
+    doi: str,
+    inferred_profiles_by_author_id: Dict[str, Dict[str, dict]]
+) -> Optional[dict]:
+    """
+    Procura um DOI nos perfis OpenAlex já inferidos para o pesquisador atual.
+    """
+    doi = normalize_doi(doi)
+    if not doi:
+        return None
+
+    for author_id, profile_dict in inferred_profiles_by_author_id.items():
+        if doi in profile_dict:
+            out = dict(profile_dict[doi])
+            out["author_id_perfil"] = author_id
+            return out
+
+    return None
+
+
+def should_auto_add_author_profile(matches) -> bool:
+    """
+    Regra conservadora para baixar automaticamente um novo perfil OpenAlex.
+    Só adiciona quando há um único match forte.
+    """
+    if not matches:
+        return False
+
+    if len(matches) != 1:
+        return False
+
+    author_id, nome_oa, score, metodo = matches[0]
+
+    if metodo != "tokens>=2":
+        return False
+
+    if score < 2:
+        return False
+
+    return True
 
 # =========================
 # Heurística (nomeLattes x autores do work OpenAlex)
@@ -990,8 +1104,14 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
     # Contadores para Sankey
     files_with_orcid = 0
     files_without_orcid = 0
-    files_with_openalex_count = 0
-    files_without_openalex_count = 0
+
+    # OpenAlex entre currículos COM ORCID
+    files_with_orcid_with_openalex = 0
+    files_with_orcid_without_openalex = 0
+
+    # OpenAlex entre currículos SEM ORCID, detectado por DOI
+    files_without_orcid_with_openalex = 0
+    files_without_orcid_without_openalex = 0
 
     # Para avisar pesquisadores: "tem OpenAlex mas não tem ORCID no Lattes"
     no_orcid_but_openalex_files = []
@@ -1041,9 +1161,41 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
             dois_list = sorted(lattes_dois)
             n_dois = len(dois_list)
 
+            if n_dois == 0:
+                consolidated_rows.append({
+                    "Arquivo": uploaded_file.name,
+                    "nomeLattes": nomeLattes,
+                    "ORCID": "Não disponível",
+                    "DOI": "Não disponível",
+                    "Título": "Não disponível",
+                    "Ano": "Não disponível",
+                    "Presente no Lattes": True,
+                    "Presente no ORCID": False,
+                    "Presente na OpenAlex": False,
+                    "ISSN-L": "Não disponível",
+                    "MatchPairs_OpenAlex": "-",
+                    "IdsOpenAlex_Provaveis": "-",
+                    "NomesOpenAlex_Provaveis": "-",
+                    "ORCIDs_Provaveis": "-",
+                    "MetodoMatch": "-",
+                    "MatchScoreMax": 0,
+                })
+
+                files_without_orcid_without_openalex += 1
+
+                df_file = pd.DataFrame(consolidated_rows)
+                per_file_df[uploaded_file.name] = df_file
+                all_report.extend(consolidated_rows)
+
+                file_progress.progress(int((file_idx / total_files) * 100))
+                continue
+
             if check_openalex_without_orcid and n_dois > 0:
                 doi_progress = st.progress(0)
                 doi_status = st.empty()
+
+            inferred_profiles_by_author_id = {}
+            inferred_author_ids = set()
 
             for i, doi in enumerate(dois_list, start=1):
                 info = lattes_articles.get(doi, {"Título": "Não disponível", "Ano": "Não disponível"})
@@ -1062,28 +1214,67 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                 score_max = 0
 
                 if check_openalex_without_orcid:
-                    lookup = openalex_lookup_by_doi(doi, openalex_client, openalex_doi_cache)
-                    presente_openalex = bool(lookup.get("found", False))
+                    perfil_hit = find_doi_in_inferred_profiles(
+                        doi,
+                        inferred_profiles_by_author_id
+                    )
 
-                    if presente_openalex:
+                    if perfil_hit:
+                        presente_openalex = True
                         found_in_openalex.append(doi)
-                        issn_l = lookup.get("issn_l") or "Sem ISSN-L"
-                        title_oa = lookup.get("title")
-                        year_oa = lookup.get("year")
 
-                        autores_work = lookup.get("authors", []) or []
-                        matches = find_all_matches_nome(nomeLattes, autores_work, min_common_tokens=2)
+                        issn_l = perfil_hit.get("ISSN-L") or "Sem ISSN-L"
+                        title_oa = perfil_hit.get("Título")
+                        year_oa = perfil_hit.get("Ano")
 
-                        match_pairs, ids_prob, nomes_prob, metodo_match, score_max = join_matches_for_cells(matches)
-                        orcids_prob = get_orcids_for_matches(
-                            matches,
-                            autores_work,
-                            openalex_client,
-                            openalex_author_cache,
-                        )
+                        author_id_hit = perfil_hit.get("author_id_perfil", "-")
+                        match_pairs = f"{author_id_hit}|perfil_inferido"
+                        ids_prob = author_id_hit
+                        nomes_prob = "Perfil OpenAlex inferido anteriormente"
+                        orcids_prob = "-"
+                        metodo_match = "perfil_inferido"
+                        score_max = 0
+
+                    else:
+                        lookup = openalex_lookup_by_doi(doi, openalex_client, openalex_doi_cache)
+                        presente_openalex = bool(lookup.get("found", False))
+
+                        if presente_openalex:
+                            found_in_openalex.append(doi)
+                            issn_l = lookup.get("issn_l") or "Sem ISSN-L"
+                            title_oa = lookup.get("title")
+                            year_oa = lookup.get("year")
+
+                            autores_work = lookup.get("authors", []) or []
+                            matches = find_all_matches_nome(nomeLattes, autores_work, min_common_tokens=2)
+
+                            match_pairs, ids_prob, nomes_prob, metodo_match, score_max = join_matches_for_cells(matches)
+                            orcids_prob = get_orcids_for_matches(
+                                matches,
+                                autores_work,
+                                openalex_client,
+                                openalex_author_cache,
+                            )
+
+                            if should_auto_add_author_profile(matches):
+                                novo_author_id = matches[0][0]
+
+                                if novo_author_id not in inferred_author_ids:
+                                    perfil_pubs = get_publications_from_openalex_by_author_id(
+                                        novo_author_id,
+                                        openalex_client
+                                    )
+                                    time.sleep(OPENALEX_ORCID_RATE_LIMIT)
+
+                                    inferred_profiles_by_author_id[novo_author_id] = build_openalex_profile_dict(
+                                        perfil_pubs)
+                                    inferred_author_ids.add(novo_author_id)
 
                     if doi_progress and doi_status:
-                        doi_status.write(f"Consultando OpenAlex por DOI: {i}/{n_dois}")
+                        doi_status.write(
+                            f"Consultando OpenAlex/cache por DOI: {i}/{n_dois} "
+                            f"| perfis inferidos: {len(inferred_author_ids)}"
+                        )
                         doi_progress.progress(int((i / n_dois) * 100))
 
                     time.sleep(OPENALEX_DOI_LOOKUP_RATE_LIMIT)
@@ -1153,6 +1344,10 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
                         "MetodoMatch": (linha.get("MetodoMatch") if linha else "-"),
                         "MatchScoreMax": (linha.get("MatchScoreMax") if linha else 0),
                     })
+            if len(found_in_openalex) > 0:
+                files_without_orcid_with_openalex += 1
+            else:
+                files_without_orcid_without_openalex += 1
 
             file_progress.progress(int((file_idx / total_files) * 100))
             continue
@@ -1173,9 +1368,9 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
         openalex_dict = {p["DOI"]: p for p in openalex_pubs if p.get("DOI")}
 
         if openalex_pubs:
-            files_with_openalex_count += 1
+            files_with_orcid_with_openalex += 1
         else:
-            files_without_openalex_count += 1
+            files_with_orcid_without_openalex += 1
 
         union_dois = set(lattes_dois) | set(orcid_dict.keys()) | set(openalex_dict.keys())
         union_dois_list = sorted(union_dois)
@@ -1281,8 +1476,10 @@ if uploaded_files and process_clicked and not st.session_state["processed"]:
         "sankey": {
             "files_with_orcid": files_with_orcid,
             "files_without_orcid": files_without_orcid,
-            "files_with_openalex_count": files_with_openalex_count,
-            "files_without_openalex_count": files_without_openalex_count,
+            "files_with_orcid_with_openalex": files_with_orcid_with_openalex,
+            "files_with_orcid_without_openalex": files_with_orcid_without_openalex,
+            "files_without_orcid_with_openalex": files_without_orcid_with_openalex,
+            "files_without_orcid_without_openalex": files_without_orcid_without_openalex,
         },
         "options": {
             "check_openalex_without_orcid": check_openalex_without_orcid
@@ -1313,14 +1510,25 @@ if st.session_state["processed"] and st.session_state["results"]:
     st.markdown("## Identificação nas bases")
 
     s = results["sankey"]
-    sankey_labels = ["Arquivos Enviados", "Tem ORCID", "Sem ORCID", "Tem OpenAlex", "Sem OpenAlex"]
-    sankey_source = [0, 0, 1, 1]
-    sankey_target = [1, 2, 3, 4]
+    sankey_labels = [
+        "Arquivos Enviados",
+        "Tem ORCID",
+        "Sem ORCID",
+        "Com ORCID + OpenAlex",
+        "Com ORCID + Sem OpenAlex",
+        "Sem ORCID + OpenAlex por DOI",
+        "Sem ORCID + Sem OpenAlex",
+    ]
+
+    sankey_source = [0, 0, 1, 1, 2, 2]
+    sankey_target = [1, 2, 3, 4, 5, 6]
     sankey_values = [
         s["files_with_orcid"],
         s["files_without_orcid"],
-        s["files_with_openalex_count"],
-        s["files_without_openalex_count"],
+        s["files_with_orcid_with_openalex"],
+        s["files_with_orcid_without_openalex"],
+        s["files_without_orcid_with_openalex"],
+        s["files_without_orcid_without_openalex"],
     ]
 
     sankey_fig = go.Figure(data=[go.Sankey(
@@ -1335,7 +1543,15 @@ if st.session_state["processed"] and st.session_state["results"]:
             thickness=22,
             line=dict(color="black", width=0.8),
             label=sankey_labels,
-            color=["lightblue", "lightgreen", "salmon", "gold", "orange"]
+            color=[
+                "lightblue",
+                "lightgreen",
+                "salmon",
+                "gold",
+                "orange",
+                "mediumseagreen",
+                "lightcoral",
+            ]
         ),
         link=dict(
             source=sankey_source,
