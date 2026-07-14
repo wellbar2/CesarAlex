@@ -190,3 +190,5 @@ O objetivo é facilitar leitura e comparação, mas o **vínculo principal de co
 ## Como citar / referenciar o projeto
 
 Se você utilizar o CesarAlex em um relatório, artigo ou produto acadêmico, você pode referenciar o repositório e a instância hospedada, destacando o uso para análise de interseção entre bases via identificadores persistentes (DOI/ORCID).
+
+A CesarAlex foi utilizada como base gerar os dados do artigo https://biblios.pitt.edu/ojs/biblios/article/view/1370
