@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: >-
+  If you use CesarAlex in research, please cite this software and the associated
+  research paper when appropriate.
+title: >-
+  CesarAlex: integration of Lattes curricula, ORCID, and OpenAlex for
+  bibliometric coverage analysis
+type: software
+authors:
+  - given-names: Wellington Barbosa
+    family-names: Rodrigues
+    orcid: https://orcid.org/0000-0002-6465-6012
+    affiliation: Universidade Federal do ABC and Universidade de São Paulo, Brazil
+  - given-names: Thamyres Vieira dos
+    family-names: Santos
+    orcid: https://orcid.org/0000-0003-3644-8600
+    affiliation: Universidade de São Paulo and Hospital Israelita Albert Einstein, Brazil
+  - given-names: Rogério
+    family-names: Mugnaini
+    orcid: https://orcid.org/0000-0001-9334-3448
+    affiliation: Universidade de São Paulo, Brazil
+version: 1.0.0
+date-released: 2026-09-05
+repository-code: https://github.com/wellbar2/CesarAlex
+url: https://cesaralex-beta.streamlit.app/
+license: GPL-3.0-only
+abstract: >-
+  CesarAlex integrates publication records from Brazilian Lattes curricula,
+  ORCID profiles, and OpenAlex. It normalizes DOI identifiers, compares source
+  coverage, supports conservative author-profile inference, and exports
+  per-researcher and consolidated reports for bibliometric research.
+keywords:
+  - Lattes Platform
+  - ORCID
+  - OpenAlex
+  - bibliometrics
+  - scientometrics
+  - persistent identifiers

@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cesaralex"
+version = "1.0.0"
+description = "Integração e análise de cobertura entre currículos Lattes, ORCID e OpenAlex"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Wellington Barbosa Rodrigues" },
+  { name = "Thamyres Vieira dos Santos" },
+  { name = "Rogério Mugnaini" },
+]
+keywords = ["Lattes", "ORCID", "OpenAlex", "bibliometrics", "scientometrics"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+  "beautifulsoup4>=4.14,<5",
+  "matplotlib>=3.10,<4",
+  "matplotlib-venn>=1.1,<2",
+  "pandas>=2.3,<3",
+  "plotly>=6.5,<7",
+  "requests>=2.32,<3",
+  "streamlit>=1.53,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/wellbar2/CesarAlex"
+Repository = "https://github.com/wellbar2/CesarAlex"
+Issues = "https://github.com/wellbar2/CesarAlex/issues"
+Documentation = "https://github.com/wellbar2/CesarAlex#readme"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pytest>=8,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.14,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["cesaralex*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+branch = true
+source = ["cesaralex"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]

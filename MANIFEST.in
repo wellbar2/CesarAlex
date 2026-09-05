@@ -1,0 +1,15 @@
+include AUTHORS.md
+include CHANGELOG.md
+include CITATION.cff
+include CONTRIBUTING.md
+include CONTRIBUTING.en.md
+include GOVERNANCE.md
+include LICENSE
+include README.md
+include README.en.md
+include SUPPORT.md
+include requirements*.txt
+recursive-include docs *.md
+recursive-include examples *.html *.py
+recursive-include paper *.bib *.md
+recursive-include tests *.py

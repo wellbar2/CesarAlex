@@ -1,194 +1,195 @@
-# CesarAlex — Interseção entre Lattes, ORCID e OpenAlex via Identificadores Persistentes
+# CesarAlex
 
-O app **CesarAlex** é uma aplicação web para explorar e compreender a **interseção entre três fontes amplamente utilizadas na comunicação científica**:
+[English documentation](README.en.md) · Versão estável: **1.0.0**
 
-- **Currículo Lattes** (a partir de arquivos HTML)
-- **ORCID** (identificador persistente de pesquisador e lista de obras associadas)
-- **OpenAlex** (base informacional aberta de metadados bibliográficos)
+O CesarAlex é uma aplicação web para integrar e comparar registros de produção
+científica presentes em currículos **Lattes**, perfis **ORCID** e na **OpenAlex**.
+O DOI é a chave principal de comparação e o resultado mostra, para cada obra, em
+quais fontes o identificador foi localizado.
 
-O foco do CesarAlex é **conectar e comparar registros usando Identificadores Únicos Persistentes (PIDs)** — principalmente **DOI** (para publicações) e **ORCID** (para autoria).  
-Isso permite identificar o que aparece em mais de uma base, o que aparece apenas em uma delas e onde estão as diferenças de cobertura.
+A interface continua disponível em Streamlit e preserva os controles, relatórios
+CSV, gráfico de fluxo e diagrama de cobertura já utilizados no projeto.
 
----
+Instância pública: <https://cesaralex-beta.streamlit.app/>
 
-## Acesse o app (instância hospedada)
+## Por que o CesarAlex é necessário?
 
-O CesarAlex está disponível em:
+O Currículo Lattes é a principal fonte curricular da comunidade científica
+brasileira, enquanto ORCID e OpenAlex oferecem identificadores e metadados com
+alcance internacional. Consultar essas fontes separadamente torna difícil saber,
+para cada pesquisador e DOI, quais produções estão presentes, ausentes ou apenas
+em uma das bases. O CesarAlex automatiza essa integração e produz dados
+auditáveis para estudos bibliométricos, diagnóstico de cobertura, curadoria de
+identificadores e avaliação da completude de perfis acadêmicos.
 
-https://cesaralex-beta.streamlit.app/
+O público principal inclui pesquisadores em Bibliometria e Cientometria,
+bibliotecários, gestores de pesquisa e equipes que trabalham com dados da
+Plataforma Lattes. A relação com ferramentas existentes e a motivação científica
+são detalhadas no [artigo preparado para a JOSS](paper/paper.md).
 
----
+## Funcionalidades
+
+- leitura simultânea de um ou vários currículos Lattes em HTML;
+- extração de nome, ORCID, DOI, título e ano do Lattes;
+- recuperação de obras pela API pública do ORCID;
+- recuperação paginada de obras da OpenAlex por ORCID;
+- verificação opcional de currículos sem ORCID por DOI;
+- inferência conservadora do ID OpenAlex por correspondência de nome;
+- cache do perfil OpenAlex inferido para evitar consultas DOI a DOI desnecessárias;
+- relatórios individuais e consolidado em CSV;
+- identificação de currículos sem ORCID com produção localizada na OpenAlex;
+- visualizações de fluxo e sobreposição entre as três fontes;
+- acompanhamento, no menu lateral, dos saldos e do custo reportado pela OpenAlex.
+
+## Saldos e consumo da OpenAlex
+
+O menu lateral apresenta três barras:
+
+1. currículos processados;
+2. saldo diário restante, orçamento diário e valor usado no dia;
+3. saldo pré-pago restante.
+
+Também são exibidos o número de chamadas HTTP, as consultas em lista e
+individuais e o custo reportado pela OpenAlex durante a execução. O botão
+**Atualizar saldos** permite consultar os valores a qualquer momento. Uma nova
+consulta também é feita automaticamente no início e ao final do processamento.
+
+Quando são informadas várias chaves separadas por ponto e vírgula, a interface
+agrega os saldos das chaves válidas. As chaves não são exibidas nem incluídas nos
+relatórios.
+
+## Correção do perfil virtual
+
+Quando um DOI permite inferir com segurança um único ID de autor, o CesarAlex
+carrega uma vez as obras desse perfil. Os próximos DOIs são procurados primeiro
+nesse índice local. Um acerto pelo perfil virtual agora:
+
+- marca `Presente na OpenAlex` como `True`;
+- conserva o ID OpenAlex real em `IdsOpenAlex_Provaveis`;
+- apresenta o nome real em `NomesOpenAlex_Provaveis` e `MatchPairs_OpenAlex`;
+- registra `perfil_inferido` em `MetodoMatch`;
+- não dispara uma nova consulta por DOI.
+
+Se o DOI seguinte não existir nos perfis já conhecidos, a consulta direta à
+OpenAlex é realizada normalmente. Um novo perfil forte pode então ser adicionado
+ao índice do currículo atual.
+
 ## Instalação
 
+O projeto requer Python 3.10 ou superior.
+
+```bash
 git clone https://github.com/wellbar2/CesarAlex.git
-
 cd CesarAlex
+python -m venv .venv
+python -m pip install -e .
+```
 
-pip install -r requirements.txt
+No Windows, ative o ambiente com `.venv\Scripts\activate`. Em Linux ou macOS,
+utilize `source .venv/bin/activate`.
 
+## Execução
+
+```bash
 streamlit run app.py
+```
 
----
-## Para quem é o CesarAlex?
+Na barra lateral, informe uma ou mais chaves OpenAlex, separadas por ponto e
+vírgula. Em seguida, envie os HTMLs do Lattes e selecione **Processar currículos**.
 
-O CesarAlex é útil para:
+A opção **Verificar OpenAlex mesmo sem ORCID (por DOI)** ativa a inferência de
+perfil e a busca complementar DOI a DOI.
 
-- Pesquisadores que desejam **entender a cobertura e a sobreposição** de suas publicações entre bases
-- Grupos de pesquisa, programas e laboratórios que precisam observar a interseção de registros de um conjunto de currículos
-- Bibliotecários e analistas que trabalham com **curadoria e padronização de identificadores**
-- Pessoas que produzem análises bibliométricas/cientométricas com dados abertos e querem **verificar consistência via PIDs**
+Um roteiro completo, incluindo como exportar o HTML do Lattes, interpretar os
+resultados e executar o exemplo sem rede, está em [docs/USAGE.md](docs/USAGE.md).
+O arquivo [examples/curriculo_lattes_sintetico.html](examples/curriculo_lattes_sintetico.html)
+não contém dados pessoais e pode ser usado para verificar a leitura do HTML.
 
----
+## Documentação
 
-## O que o app faz
+- [Instalação detalhada](docs/INSTALLATION.md)
+- [Guia de uso e exemplo reproduzível](docs/USAGE.md)
+- [Arquitetura e decisões de projeto](docs/ARCHITECTURE.md)
+- [API do núcleo Python](docs/API.md)
+- [Validação e testes](docs/VALIDATION.md)
+- [Privacidade e uso responsável](docs/PRIVACY.md)
+- [Preparação e pendências da JOSS](docs/JOSS_READINESS.md)
+- [Governança](GOVERNANCE.md) e [suporte](SUPPORT.md)
 
-A partir do upload de **um ou vários currículos Lattes em HTML**, o app CesarAlex:
+## Estrutura
 
-1. **Detecta se existe ORCID no Lattes** (a partir do link `orcid.org` no HTML).
-2. **Extrai DOIs do Lattes**, quando eles aparecem como link de DOI na produção.
-3. Quando há ORCID:
-   - Consulta o **ORCID** e obtém publicações associadas ao perfil (quando houver DOI disponível nas obras).
-   - Consulta a **OpenAlex** usando o **ORCID** para obter publicações (incluindo **DOI** e **ISSN-L** quando disponível).
-4. Quando **não há ORCID no Lattes**:
-   - Opcionalmente (configurável na interface), consulta a **OpenAlex por DOI**, DOI a DOI, para verificar presença na base.
-5. **Consolida os resultados por DOI**, indicando em quais bases cada DOI aparece.
-6. Permite **download em CSV**:
-   - Um CSV por pesquisador/arquivo
-   - Um CSV consolidado (geral)
-   - CSVs extras quando há casos “OpenAlex encontrado por DOI, mas ORCID ausente no Lattes”
+```text
+app.py                  entrada Streamlit
+cesaralex/
+  clients.py            clientes ORCID/OpenAlex e caches de requisição
+  config.py             parâmetros internos centralizados
+  lattes.py             leitura do HTML Lattes
+  matching.py           heurística de correspondência de autoria
+  models.py             modelos de domínio
+  processor.py          fluxo principal, independente da interface
+  profiles.py           cache de perfis virtuais inferidos
+  reporting.py          CSVs, contadores e preparação de tabelas
+  ui.py                 interface Streamlit
+  usage.py              saldos, custos e agregação de múltiplas chaves
+  visualizations.py     Sankey e diagrama de cobertura
+tests/                  testes automatizados
+docs/                   documentação técnica e de uso
+examples/               exemplo sintético e demonstração sem rede
+paper/                   artigo e referências para a JOSS
+```
 
----
+Essa separação permite validar o processamento sem iniciar o Streamlit nem fazer
+requisições reais às APIs.
 
-## Identificadores persistentes utilizados
+## Testes e qualidade
 
-- **ORCID**: usado para recuperar obras no ORCID e também para consultar obras na OpenAlex associadas a um autor.
-- **DOI**: usado como chave principal para comparar registros entre as bases (e também para consulta direta na OpenAlex quando não há ORCID).
+Instale as dependências de desenvolvimento e execute:
 
-> Importante: se uma obra não possui DOI (ou se o DOI não aparece/está divergente na fonte), ela pode não entrar na comparação.
+```bash
+python -m pip install -r requirements-dev.txt
+python -m ruff format --check cesaralex tests examples app.py
+python -m ruff check cesaralex tests examples app.py
+python -m pytest
+python -m pytest --cov=cesaralex
+```
 
----
+Os testes incluem uma regressão específica para o acerto por perfil virtual: o
+segundo DOI deve ser marcado como presente na OpenAlex, manter ID e nome corretos
+e não realizar uma segunda consulta DOI.
 
-## Visualizações disponíveis
+## Saídas principais
 
-O app apresenta duas visualizações principais:
+Os CSVs mantêm separador `;`, codificação UTF-8 e aspas duplas em todos os
+campos. As colunas principais são:
 
-### 1) “Identificação nas bases”
-Um gráfico que mostra, a partir do conjunto de arquivos enviados:
-- Quantos currículos **têm ORCID** no HTML
-- Quantos currículos **não têm ORCID**
-- Entre os currículos com ORCID, quantos retornam publicações na **OpenAlex** e quantos não retornam
+- `Arquivo`, `nomeLattes`, `ORCID`, `DOI`, `Título`, `Ano`;
+- `Presente no Lattes`, `Presente no ORCID`, `Presente na OpenAlex`;
+- `ISSN-L`;
+- `MatchPairs_OpenAlex`, `IdsOpenAlex_Provaveis`,
+  `NomesOpenAlex_Provaveis`, `ORCIDs_Provaveis`, `MetodoMatch`,
+  `MatchScoreMax`.
 
-### 2) “Cobertura entre as bases”
-Um diagrama de Venn com **Lattes × ORCID × OpenAlex**, calculado a partir do relatório consolidado por DOI, exibindo:
-- Contagens em cada região do diagrama
-- Percentuais em cada região do diagrama
+## Limitações
 
----
+- obras sem DOI não entram na comparação principal;
+- a qualidade da integração depende dos identificadores informados nas fontes;
+- a inferência de autoria é conservadora, mas continua sendo uma heurística;
+- limites e disponibilidade das APIs externas podem afetar o processamento;
+- a instância pública do Streamlit possui menos recursos que uma execução local.
 
-## Arquivos de saída (downloads)
+Os arquivos Lattes podem conter dados pessoais. Consulte as orientações de
+[privacidade e uso responsável](docs/PRIVACY.md) antes de processar ou compartilhar
+currículos de terceiros.
 
-Após o processamento, o app oferece:
+## Autoria e citação
 
-### 1) CSV por pesquisador (por arquivo HTML)
-Um botão “Baixar CSV de: <nome do arquivo>”.
+- Wellington Barbosa Rodrigues — desenvolvimento e responsabilidade técnica;
+- Thamyres Vieira dos Santos — concepção e orientação de domínio;
+- Rogério Mugnaini — concepção, orientação de domínio e direção do projeto.
 
-Cada CSV individual contém, por DOI, as colunas:
-- `Arquivo`
-- `ORCID` (ou “Não disponível” quando não encontrado)
-- `DOI`
-- `Título`
-- `Ano`
-- `Presente no Lattes` (True/False)
-- `Presente no ORCID` (True/False)
-- `Presente na OpenAlex` (True/False)
-- `ISSN-L` (quando disponível via OpenAlex)
+Os metadados para citar o software estão em [CITATION.cff](CITATION.cff). As
+contribuições são descritas em [AUTHORS.md](AUTHORS.md).
 
-### 2) CSV consolidado (todos os arquivos)
-Um relatório geral reunindo todas as linhas (todos os currículos processados), com as mesmas colunas.
+## Licença
 
-### 3) Casos “OpenAlex encontrado por DOI, mas sem ORCID no Lattes”
-Quando a opção de consulta por DOI está ativa e o HTML não contém ORCID, o app pode gerar:
-- Um CSV por arquivo com o resumo do caso (quantos DOIs do Lattes foram encontrados na OpenAlex e exemplos)
-- Um CSV com as linhas DOI-a-DOI explicando o motivo
-
-Esses arquivos ajudam a identificar situações em que **há sinais de presença na OpenAlex (via DOI), mas o ORCID não está registrado no Lattes**.
-
----
-
-## Como usar
-
-### Passo 1 — Exportar o Lattes em HTML
-1. Acesse o Currículo Lattes desejado
-2. Exporte/baixe o currículo em **HTML** (para grandes volumes recomenda-se o uso do scriptLattes)
-3. Salve o arquivo no seu computador
-
-Repita para quantos currículos quiser comparar.
-
-### Passo 2 — Enviar os arquivos no app
-1. Acesse o app: https://cesaralex-beta.streamlit.app/
-2. Em “Selecione os arquivos de currículo Lattes (HTML)”, envie um ou vários arquivos
-
-### Passo 3 — Escolher opções
-Na barra lateral, você pode ativar/desativar:
-
-**“Verificar OpenAlex mesmo sem ORCID (por DOI)”**
-
-- Ativada: se o currículo não tiver ORCID, o app ainda tenta verificar a OpenAlex consultando DOI por DOI.
-- Desativada: sem ORCID, o app fica restrito ao que estiver disponível no Lattes (e não faz consulta DOI-a-DOI na OpenAlex).
-
-### Passo 4 — Processar
-Clique em **“Processar currículos”**.
-
-### Passo 5 — Explorar e baixar resultados
-Depois de concluir, você poderá:
-- Baixar CSVs individuais por currículo
-- Ver as visualizações (fluxo e Venn)
-- Baixar o CSV consolidado e (se aplicável) os CSVs de casos sem ORCID no Lattes
-
----
-
-## Limitações da versão hospedada e uso em maior escala
-
-A instância hospedada do CesarAlex foi disponibilizada para uso público e demonstração, e por isso pode apresentar **limitações práticas** no processamento de grandes volumes de currículos (por exemplo, tempo total de execução e limites de recursos do ambiente de hospedagem).
-
-Para análises em maior escala, **acima de 100 currículos**, recomendamos **entrar em contato com os autores** para solicitar a **versão destinada à execução em máquina local**, adequada para processamento de volumes maiores.
-
-
----
-
-## Como interpretar os resultados
-
-### “Presente no Lattes / ORCID / OpenAlex”
-Esses campos indicam se o **mesmo DOI** apareceu naquela base.
-
-Por exemplo:
-- DOI presente em Lattes e OpenAlex, mas não em ORCID → pode indicar que a obra não está associada ao perfil ORCID, ou que o DOI não foi incluído/registrado naquela entrada do ORCID.
-- DOI presente em ORCID e OpenAlex, mas não no Lattes → pode indicar ausência no currículo exportado, diferenças de cadastro, ou recortes do que está no HTML.
-- DOI presente apenas em uma base → pode indicar diferenças de cobertura, atualização, metadados ou ausência do identificador em alguma fonte.
-
-### Observação sobre Título e Ano
-O app preenche `Título` e `Ano` com base em prioridades (dependendo do caso), podendo usar informações de ORCID, Lattes ou OpenAlex, e não havendo forte consistência nesse campo.  
-O objetivo é facilitar leitura e comparação, mas o **vínculo principal de comparação é o DOI**.
-
----
-
-## Limitações esperadas
-
-- Obras sem DOI (ou com DOI ausente no HTML/ORCID) podem ficar fora da comparação.
-- O Lattes em HTML pode não expor DOIs em todos os itens (depende de como a produção está registrada).
-- Diferenças de registro entre bases podem ocorrer (mesmo para a “mesma” obra), especialmente quando o identificador está incompleto ou divergente.
-
----
-
-## Créditos
-
-- **Desenvolvimento e responsabilidade técnica:** Wellington Barbosa Rodrigues  
-- **Concepção e orientação de domínio:** Rogério Mugnaini; Thamyres Vieira dos Santos
-
----
-
-## Como citar / referenciar o projeto
-
-Se você utilizar o CesarAlex em um relatório, artigo ou produto acadêmico, você pode referenciar o repositório e a instância hospedada, destacando o uso para análise de interseção entre bases via identificadores persistentes (DOI/ORCID).
-
-A CesarAlex foi utilizada como base gerar os dados do artigo https://biblios.pitt.edu/ojs/biblios/article/view/1370
+GNU General Public License v3.0. Consulte o arquivo `LICENSE`.
