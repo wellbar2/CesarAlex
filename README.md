@@ -1,6 +1,6 @@
 # CesarAlex
 
-[English documentation](README.en.md) · Versão estável: **1.0.0**
+[English documentation](README.en.md) · Versão declarada no código: **1.0.0**
 
 O CesarAlex é uma aplicação web para integrar e comparar registros de produção
 científica presentes em currículos **Lattes**, perfis **ORCID** e na **OpenAlex**.
@@ -82,11 +82,16 @@ O projeto requer Python 3.10 ou superior.
 git clone https://github.com/wellbar2/CesarAlex.git
 cd CesarAlex
 python -m venv .venv
+```
+
+Ative o ambiente antes de instalar: `.venv\Scripts\activate` no Prompt de
+Comando do Windows, `.venv\Scripts\Activate.ps1` no PowerShell, ou
+`source .venv/bin/activate` no Linux/macOS.
+
+```bash
 python -m pip install -e .
 ```
 
-No Windows, ative o ambiente com `.venv\Scripts\activate`. Em Linux ou macOS,
-utilize `source .venv/bin/activate`.
 
 ## Execução
 
@@ -193,3 +198,19 @@ contribuições são descritas em [AUTHORS.md](AUTHORS.md).
 ## Licença
 
 GNU General Public License v3.0. Consulte o arquivo `LICENSE`.
+
+## Scientific publications / Publicações científicas
+
+- **Origin of the research approach:** Rodrigues, Santos, and Mugnaini (2026), *BiblioS*, [DOI: 10.5195/biblios.2026.1370](https://doi.org/10.5195/biblios.2026.1370). The study developed the scientific basis for the three-source DOI coverage analysis; do not assume it was run with the current release.
+- **Confirmed application of CesarAlex:** Rodrigues, Tomassini, Mugnaini, and Mena-Chalco (2026), *Além do ORCID autodeclarado no Lattes: inferência de identificadores via DOI–OpenAlex e seus limites*, X EBBC, [DOI: 10.22477/x.ebbc.1017](https://doi.org/10.22477/x.ebbc.1017). The project lead confirms that this study used CesarAlex. The reported inference rates are specific to the studied population and should not be presented as general software accuracy.
+
+
+## Evidências de validação
+
+Em 29/10/2026, o espelho fornecido foi instalado em ambiente Linux limpo com
+Python 3.12.14: os 28 testes passaram, incluindo a inicialização do Streamlit.
+Ruff, verificação de dependências e construção das distribuições também passaram.
+Esses testes usam respostas controladas; a validação com HTMLs originais e
+consultas autenticadas ainda está pendente. Veja
+[os resultados](docs/RESULTADOS_VALIDACAO_2026-10-29.md) e o
+[roteiro com dados reais](docs/VALIDACAO_REAL_PASSO_A_PASSO.md).

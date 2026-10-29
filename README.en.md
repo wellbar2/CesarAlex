@@ -1,6 +1,6 @@
 # CesarAlex
 
-[Documentação em português](README.md) · Stable version: **1.0.0**
+[Documentação em português](README.md) · Version declared in the source: **1.0.0**
 
 CesarAlex is a Streamlit application and a reusable Python core for integrating
 and comparing publication records from Brazilian **Lattes curricula**, **ORCID**
@@ -48,11 +48,16 @@ CesarAlex requires Python 3.10 or newer.
 git clone https://github.com/wellbar2/CesarAlex.git
 cd CesarAlex
 python -m venv .venv
+```
+
+Activate the environment before installing: `.venv\Scripts\activate` in
+Windows Command Prompt, `.venv\Scripts\Activate.ps1` in PowerShell, or
+`source .venv/bin/activate` on Linux/macOS.
+
+```bash
 python -m pip install -e .
 ```
 
-Activate the environment with `.venv\Scripts\activate` on Windows or
-`source .venv/bin/activate` on Linux and macOS.
 
 ## Running the application
 
@@ -181,3 +186,19 @@ roles are described in [AUTHORS.md](AUTHORS.md).
 
 CesarAlex is distributed under the GNU General Public License v3.0 only. See
 [LICENSE](LICENSE).
+
+## Scientific publications / Publicações científicas
+
+- **Origin of the research approach:** Rodrigues, Santos, and Mugnaini (2026), *BiblioS*, [DOI: 10.5195/biblios.2026.1370](https://doi.org/10.5195/biblios.2026.1370). The study developed the scientific basis for the three-source DOI coverage analysis; do not assume it was run with the current release.
+- **Confirmed application of CesarAlex:** Rodrigues, Tomassini, Mugnaini, and Mena-Chalco (2026), *Além do ORCID autodeclarado no Lattes: inferência de identificadores via DOI–OpenAlex e seus limites*, X EBBC, [DOI: 10.22477/x.ebbc.1017](https://doi.org/10.22477/x.ebbc.1017). The project lead confirms that this study used CesarAlex. The reported inference rates are specific to the studied population and should not be presented as general software accuracy.
+
+
+## Validation evidence
+
+On 29 October 2026 the supplied snapshot was installed in a clean Linux
+environment with Python 3.12.14. All 28 tests passed, including Streamlit startup.
+Ruff checks, dependency checks, and distribution builds also passed.
+These checks use controlled responses; original-curriculum and authenticated
+network validation remain pending. See the
+[execution record](docs/RESULTADOS_VALIDACAO_2026-10-29.md) and
+[real-data validation guide, in Portuguese](docs/VALIDACAO_REAL_PASSO_A_PASSO.md).

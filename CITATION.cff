@@ -20,7 +20,6 @@ authors:
     orcid: https://orcid.org/0000-0001-9334-3448
     affiliation: Universidade de São Paulo, Brazil
 version: 1.0.0
-date-released: 2026-09-05
 repository-code: https://github.com/wellbar2/CesarAlex
 url: https://cesaralex-beta.streamlit.app/
 license: GPL-3.0-only
